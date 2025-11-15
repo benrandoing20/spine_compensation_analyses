@@ -1,0 +1,60 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Logs
+logs/
+*.log
+
+# Analysis outputs
+analysis/results/
+analysis/enhanced_output/
+analysis/comparison/
+
+# Visualization plots
+visualization/plots/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
