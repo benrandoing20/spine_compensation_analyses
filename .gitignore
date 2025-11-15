@@ -16,6 +16,12 @@ analysis/comparison/
 # Visualization plots
 visualization/plots/
 
+# RL checkpoints
+rl/grpo_checkpoints_test/
+rl/**/checkpoints/
+rl/**/*.pt
+rl/**/*.ckpt
+
 # Python
 __pycache__/
 *.py[cod]
