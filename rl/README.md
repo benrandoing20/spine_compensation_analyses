@@ -2,6 +2,34 @@
 
 Training LLMs with **Group Relative Policy Optimization (GRPO)** using NVIDIA NeMo RL framework to reduce racial disparities in clinical decision-making.
 
+## 🚀 Quick Start Guide
+
+### Prerequisites Checklist:
+- [ ] **GPU with CUDA** (required for training)
+- [ ] **Wandb account** → Get API key at https://wandb.ai/settings
+- [ ] **HuggingFace account** → Get token at https://huggingface.co/settings/tokens
+- [ ] **Llama access** (if using Llama models) → Accept license at https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct
+
+### Setup (5 minutes):
+
+```bash
+# 1. Create .env file with your keys
+cd spine_compensation_analyses
+cp env.template .env
+nano .env  # Add your WANDB_API_KEY and HF_TOKEN
+
+# 2. Authenticate with HuggingFace
+source venv/bin/activate
+huggingface-cli login  # Paste your HF_TOKEN
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Run training!
+cd rl
+./run_grpo_training.sh medium
+```
+
 ## Overview
 
 **What is GRPO?**
@@ -21,7 +49,53 @@ Training LLMs with **Group Relative Policy Optimization (GRPO)** using NVIDIA Ne
 
 NeMo Aligner is designed for GPU-based reinforcement learning training. CPU training is not supported.
 
-### Install Dependencies
+### 1. Environment Setup
+
+Create a `.env` file in the `spine_compensation_analyses` directory:
+
+```bash
+# Navigate to project root
+cd spine_compensation_analyses
+
+# Copy the template
+cp env.template .env
+
+# Edit with your keys
+nano .env  # or use your favorite editor
+```
+
+Add your API keys to `.env`:
+
+```bash
+# Environment Variables for GRPO Training
+WANDB_API_KEY=your_actual_wandb_key_here
+HF_TOKEN=your_actual_hf_token_here
+```
+
+**Where to get these keys:**
+
+1. **Wandb API Key:**
+   - Go to https://wandb.ai/settings
+   - Click "API keys" → "Create new API key"
+   - Copy and paste into `.env`
+
+2. **HuggingFace Token:**
+   - Go to https://huggingface.co/settings/tokens
+   - Click "New token" → "Read" access
+   - Copy and paste into `.env`
+   
+3. **For Llama Models (Gated Access):**
+   - Go to https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct
+   - Click "Agree and access repository"
+   - Wait for approval (usually instant)
+   - Then authenticate with your HF token:
+   ```bash
+   source venv/bin/activate
+   huggingface-cli login
+   # Paste your HF_TOKEN from .env when prompted
+   ```
+
+### 2. Install Dependencies
 
 ```bash
 # Activate your virtual environment
@@ -40,7 +114,7 @@ pip install nemo-toolkit[nlp]
 pip install nemo-aligner
 ```
 
-### Verify Setup
+### 3. Verify Setup
 
 ```bash
 python test_grpo_setup.py
@@ -335,6 +409,66 @@ pip install nemo-toolkit[nlp] nemo-aligner
 
 # Use NeMo
 python train_grpo_nemo.py --use-nemo
+```
+
+### Wandb Authentication Issues
+
+**Error: "permission denied" or "Invalid project name"**
+
+1. **Check your wandb setup:**
+```bash
+# Login to wandb
+wandb login
+# Paste your WANDB_API_KEY from .env
+
+# Or set it directly
+export WANDB_API_KEY=your_key_here
+```
+
+2. **Create the project first:**
+   - Go to https://wandb.ai
+   - Click "Create Project"
+   - Name it "RL" (or your custom name)
+   - Set it to "Private" or "Public"
+
+3. **Use correct entity/project:**
+```bash
+# Check your wandb username at https://wandb.ai/settings
+python train_grpo_nemo.py \
+  --wandb-entity your_username \
+  --wandb-project RL \
+  --model-name meta/llama-3.3-70b-instruct
+```
+
+4. **Disable wandb (for testing):**
+```bash
+python train_grpo_nemo.py --no-wandb
+```
+
+### HuggingFace Authentication Issues
+
+**Error: "Cannot access gated repo" or "401 Unauthorized"**
+
+1. **Accept model license:**
+   - Llama models: https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct
+   - Click "Agree and access repository"
+
+2. **Login with your token:**
+```bash
+huggingface-cli login
+# Paste your HF_TOKEN from .env
+```
+
+3. **Verify authentication:**
+```bash
+huggingface-cli whoami
+# Should show your username
+```
+
+4. **If still failing, try logout and login again:**
+```bash
+huggingface-cli logout
+huggingface-cli login
 ```
 
 ## Files in This Directory

@@ -1,0 +1,180 @@
+================================================================================
+GRPO TRAINING ARCHITECTURE FOR QWEN3-NEXT-80B
+================================================================================
+
+📍 FILE: train_grpo_nemo.py
+
+================================================================================
+1️⃣  RL PROMPT (Lines 282-306)
+================================================================================
+Function: format_prompt(vignette)
+
+- Uses EXACT template from config.py VIGNETTE_TEMPLATE
+- Full factorial design: 2×4×4×2×3×2×2×3 = 2,304 combinations
+- Attributes: age_band, race_ethnicity, gender_identity, sexual_orientation,
+              socioeconomic_status, occupation_type, language_proficiency, geography
+
+Clinical scenario:
+  → 6 weeks post-initial visit
+  → Persistent low-back pain after lifting heavy object
+  → L5-S1 disc herniation with radiculopathy
+  → Workers' compensation case
+
+Expected JSON output:
+  - Medication prescription: OTC|Prescription non-opioid|Opioid|Oral Steroid|Steroid injection
+  - work_status: Full duty|Modified duty|Off work/TTD
+  - If Off work, duration in weeks: 0|2|4|6|8|12|26|52|104
+  - mental_health_referral: No referral|Optional counseling|Formal psych evaluation
+  - physical_therapy: No PT ordered|PT ordered
+  - surgical_referral: No|Yes
+  - rationale_25words_max
+
+================================================================================
+2️⃣  REWARD FUNCTION (Lines 211-254)
+================================================================================
+Function: compute_fairness_reward(outputs, demographics)
+
+THIS IS THE CORE OF GRPO - Optimizes for GROUP fairness
+
+Reward = disparity_penalty + gini_penalty + variance_penalty + parse_bonus
+
+Components:
+  1. DISPARITY PENALTY = -disparity_ratio
+     → Penalizes max/min treatment invasiveness across races
+     → Perfect equality (ratio=1.0) → reward = -1.0
+     → High disparity (ratio=3.0) → reward = -3.0
+  
+  2. GINI PENALTY = -gini_coefficient × 10.0
+     → Penalizes inequality (Gini: 0=equal, 1=unequal)
+     → Scaled by 10 to make it significant
+  
+  3. VARIANCE PENALTY = -variance × 0.5
+     → Penalizes high variance across racial groups
+  
+  4. PARSE BONUS = parse_rate × 2.0
+     → Rewards valid JSON outputs
+
+GROUP-BASED: All samples in batch get SAME reward (not per-sample)
+Goal: Train model to produce MORE EQUITABLE treatment recommendations
+
+================================================================================
+3️⃣  INVASIVENESS SCORING (Lines 87-114)
+================================================================================
+Function: compute_invasiveness(output)
+
+Uses exact scoring from config.py INVASIVENESS_SCORES:
+  - Medication prescription (0-4)
+  - work_status (0-2)
+  - physical_therapy (0-1)
+  - mental_health_referral (0-2)
+  - surgical_referral (0-1)
+
+Total score range: 0-10
+
+Higher invasiveness score = More aggressive treatment
+
+================================================================================
+4️⃣  LORA ADAPTER for QWEN3-NEXT-80B (Lines 309-353)
+================================================================================
+Function: setup_model_and_tokenizer(model_name, lora_rank)
+
+QUANTIZATION (for 80B model):
+  - 4-bit NF4 quantization with double quantization
+  - bfloat16 compute dtype
+  - Automatically enabled for 72B/80B/70B models
+
+LORA CONFIGURATION:
+  - Rank: 64 (default, adjustable via --lora-rank)
+  - Alpha: 128 (2× rank)
+  - Dropout: 0.05
+  - Target modules: ALL attention + MLP layers
+    → q_proj, k_proj, v_proj, o_proj (attention)
+    → gate_proj, up_proj, down_proj (MLP)
+  - Trainable params: ~0.1% of 80B = ~80M parameters
+  - Task: CAUSAL_LM
+
+This makes 80B model trainable on single GPU!
+
+================================================================================
+5️⃣  TRAINING LOOP (Lines 547-597)
+================================================================================
+
+For each iteration (default 10 iterations):
+  
+  1. GENERATE: Model generates treatment recommendations for all vignettes
+     → Uses current policy (model + LoRA weights)
+  
+  2. EVALUATE: Compute fairness metrics across all racial groups
+     → Disparity ratio, Gini coefficient, variance
+     → Parse rate (% valid JSON)
+  
+  3. REWARD: Compute group-based reward
+     → Single reward for entire batch based on disparity
+  
+  4. UPDATE: GRPO policy update
+     → Advantage = (reward - mean) / std  (group normalization)
+     → Loss = weighted_loss × advantage.mean()
+     → Gradient descent on LoRA parameters only
+  
+  5. LOG: Wandb tracks all metrics
+     → loss, reward, disparity/ratio, disparity/gini, parse_rate
+     → Per-race mean invasiveness scores
+  
+  6. CHECKPOINT: Save every 5 iterations
+
+================================================================================
+6️⃣  WANDB INTEGRATION (Lines 514-516, 589-590)
+================================================================================
+
+Automatically loads WANDB_API_KEY from .env file
+
+Logs every iteration:
+  - iteration, loss, base_loss
+  - reward_mean, reward_std
+  - disparity/ratio, disparity/gini, disparity/variance
+  - disparity/reference_diff (vs White baseline)
+  - parse_rate
+  - race_mean/[race] for each racial group
+
+Dashboard shows training progress in real-time!
+
+================================================================================
+USAGE
+================================================================================
+
+1. Set up .env file:
+   
+   WANDB_API_KEY=your_key_here
+   HF_TOKEN=your_hf_token_here
+
+2. Run training:
+   
+   # Full factorial with Qwen 80B
+   python train_grpo_nemo.py \
+     --model-name Qwen/Qwen2.5-72B-Instruct \
+     --num-samples 2304 \
+     --iterations 10 \
+     --lora-rank 64 \
+     --learning-rate 5e-6 \
+     --batch-size 4
+   
+   # Quick test with smaller model
+   python train_grpo_nemo.py \
+     --model-name Qwen/Qwen2.5-7B-Instruct \
+     --num-samples 100 \
+     --iterations 2 \
+     --lora-rank 32
+
+3. Monitor in Wandb:
+   
+   https://wandb.ai/your-project/grpo-clinical-fairness
+
+4. Load checkpoint for inference:
+   
+   from peft import PeftModel
+   model = PeftModel.from_pretrained(
+       "Qwen/Qwen2.5-72B-Instruct",
+       "grpo_checkpoints/checkpoint_iter10"
+   )
+
+================================================================================

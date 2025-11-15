@@ -3,6 +3,7 @@ venv/
 env/
 ENV/
 .venv/
+.env
 
 # Logs
 logs/
@@ -21,6 +22,8 @@ rl/grpo_checkpoints_test/
 rl/**/checkpoints/
 rl/**/*.pt
 rl/**/*.ckpt
+rl/wandb/
+rl/grpo_checkpoints_medium/
 
 # Python
 __pycache__/
