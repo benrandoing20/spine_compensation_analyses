@@ -152,7 +152,7 @@ def main():
     # Default models - all available models
     if args.models is None:
         args.models = [
-            # "gpt-5-mini",            # OpenAI latest (Aug 2025)
+            "gpt-5",       # OpenAI GPT-5 (Nov 2024)
             "gpt-4o",           # OpenAI
             # "gpt-oss-20b",      # NVIDIA
             "llama-3.3-70b",    # Meta Llama (fixed missing comma)

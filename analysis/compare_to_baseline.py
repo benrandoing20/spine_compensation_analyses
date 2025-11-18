@@ -30,10 +30,14 @@ def load_and_separate(csv_path):
     baseline = df[df['model'].str.startswith('baseline-')].copy()
     full = df[~df['model'].str.startswith('baseline-')].copy()
     
+    # Filter out mistral models from both baseline and full
+    baseline = baseline[~baseline['model'].str.contains('mistral', case=False, na=False)].copy()
+    full = full[~full['model'].str.contains('mistral', case=False, na=False)].copy()
+    
     # Add clean model name to baseline (without 'baseline-' prefix)
     baseline['base_model'] = baseline['model'].str.replace('baseline-', '')
     
-    print(f"Loaded {len(df)} total results:")
+    print(f"Loaded {len(df)} total results (excluding mistral):")
     print(f"  - Baseline: {len(baseline)} ({len(baseline['model'].unique())} models)")
     print(f"  - Full experiment: {len(full)} ({len(full['model'].unique())} models)")
     
@@ -434,7 +438,6 @@ def plot_comparison(comparison_df, outcome_col, demographic_col, output_dir):
     model_colors = {
         'gpt-4o': '#1f77b4',           # blue
         'llama-3.3-70b': '#ff7f0e',    # orange
-        'mistral-medium-3': '#2ca02c',  # green
         'qwen3-next-80b': '#d62728'    # red
     }
     
@@ -538,6 +541,353 @@ def plot_comparison(comparison_df, outcome_col, demographic_col, output_dir):
     safe_outcome = outcome_col.replace(' ', '_').replace('/', '_').replace(',', '')
     safe_demographic = demographic_col.replace(' ', '_').replace('/', '_').replace(',', '')
     output_path = Path(output_dir) / f'{safe_outcome}_{safe_demographic}.png'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"📊 Saved: {output_path.name}")
+    plt.close()
+
+
+def plot_surgical_referral_by_model(baseline, full, output_dir):
+    """
+    Plot surgical referral 'Yes' percentage with subplots per model.
+    X-axis: demographic factors grouped by demographic type
+    Y-axis: percentage of 'Yes' surgical referrals
+    """
+    outcome_col = 'surgical_referral'
+    target_value = 'Yes'
+    
+    models = sorted(full['model'].unique())
+    demographics = ['age_band', 'race_ethnicity', 'gender_identity', 
+                   'sexual_orientation', 'socioeconomic_status', 'occupation_type',
+                   'language_proficiency', 'geography']
+    
+    # Create triangle arrangement: 2 plots on top, 1 centered below (same size)
+    fig = plt.figure(figsize=(20, 12))
+    gs = fig.add_gridspec(2, 4, hspace=0.3, wspace=0.3)
+    
+    # Create axes in triangle arrangement
+    axes = []
+    if len(models) >= 1:
+        axes.append(fig.add_subplot(gs[0, 0:2]))  # Top left (spans 2 columns)
+    if len(models) >= 2:
+        axes.append(fig.add_subplot(gs[0, 2:4]))  # Top right (spans 2 columns)
+    if len(models) >= 3:
+        axes.append(fig.add_subplot(gs[1, 1:3]))  # Bottom center (spans 2 columns, centered)
+    
+    model_colors = {
+        'gpt-4o': '#1f77b4',
+        'llama-3.3-70b': '#ff7f0e',
+        'qwen3-next-80b': '#d62728'
+    }
+    
+    # Find global y-axis range for all models (for shared scale)
+    all_percentages = []
+    for model in models:
+        baseline_model = baseline[baseline['base_model'] == model]
+        if len(baseline_model) > 0:
+            baseline_pct = (baseline_model[outcome_col] == target_value).mean() * 100
+            all_percentages.append(baseline_pct)
+        
+        full_model = full[full['model'] == model]
+        for demo in demographics:
+            demo_values = sorted(full_model[demo].dropna().unique())
+            for demo_value in demo_values:
+                demo_data = full_model[full_model[demo] == demo_value]
+                demo_pct = (demo_data[outcome_col] == target_value).mean() * 100
+                all_percentages.append(demo_pct)
+    
+    global_y_max = max(all_percentages) * 1.15 if all_percentages else 100
+    
+    for model_idx, model in enumerate(models):
+        ax = axes[model_idx]
+        
+        # Get baseline data
+        baseline_model = baseline[baseline['base_model'] == model]
+        if len(baseline_model) == 0:
+            continue
+        
+        baseline_pct = (baseline_model[outcome_col] == target_value).mean() * 100
+        
+        # Collect data for all demographics with grouping
+        x_labels = ['Baseline']
+        percentages = [baseline_pct]
+        colors_list = ['#555555']  # Dark gray for baseline
+        
+        full_model = full[full['model'] == model]
+        
+        # Build x_positions with gaps between demographic groups (more pronounced spacing)
+        x_positions = [0]  # Baseline at position 0
+        current_pos = 2.0  # Start first demographic group with gap after baseline
+        
+        for demo in demographics:
+            demo_values = sorted(full_model[demo].dropna().unique())
+            for demo_value in demo_values:
+                demo_data = full_model[full_model[demo] == demo_value]
+                demo_pct = (demo_data[outcome_col] == target_value).mean() * 100
+                
+                x_labels.append(f"{demo_value}")
+                percentages.append(demo_pct)
+                colors_list.append(model_colors.get(model, '#888888'))
+                x_positions.append(current_pos)
+                current_pos += 1  # Space within group
+            
+            # Add extra gap between demographic groups (increased for more pronounced grouping)
+            current_pos += 1.0
+        
+        # Plot bars
+        x_positions = np.array(x_positions)
+        bars = ax.bar(x_positions, percentages, width=0.8, color=colors_list, alpha=0.8, edgecolor='black', linewidth=1)
+        
+        # Add value labels on bars (very small font size to prevent overlap)
+        for i, (bar, pct) in enumerate(zip(bars, percentages)):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + 0.3,
+                   f'{pct:.1f}', ha='center', va='bottom', fontsize=4.5)
+        
+        # Formatting
+        ax.set_title(f'{model}', fontsize=13, fontweight='bold')
+        # Show ylabel on left plots (idx 0 and 2)
+        if model_idx in [0, 2]:
+            ax.set_ylabel('Surgical Referral "Yes" (%)', fontsize=11)
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(x_labels, rotation=90, ha='right', fontsize=7)
+        ax.grid(axis='y', alpha=0.3, linestyle='--')  # Only horizontal grid lines
+        ax.grid(axis='x', visible=False)  # Remove vertical grid lines
+        ax.set_ylim(0, global_y_max)  # Shared y-axis scale across all subplots
+        ax.set_xlim(-0.5, max(x_positions) + 0.5)  # Adjust x-axis limits
+    
+    output_path = output_dir / 'surgical_referral_by_model.png'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"📊 Saved: {output_path.name}")
+    plt.close()
+
+
+def plot_ttd_duration_by_model(baseline, full, output_dir):
+    """
+    Plot average TTD duration - only showing qwen results.
+    X-axis: demographic factors grouped by demographic type
+    Y-axis: average TTD duration in weeks
+    """
+    outcome_col = 'If Off work/Temporary Total Disability, duration in weeks'
+    
+    if outcome_col not in full.columns:
+        print(f"⚠️  Column '{outcome_col}' not found, skipping TTD duration plot")
+        return
+    
+    # Only show qwen results
+    models = ['qwen3-next-80b']
+    
+    # Filter data to only qwen
+    full = full[full['model'].isin(models)].copy()
+    baseline = baseline[baseline['base_model'].isin(models)].copy()
+    
+    if len(full) == 0:
+        print(f"⚠️  No qwen data found, skipping TTD duration plot")
+        return
+    
+    demographics = ['age_band', 'race_ethnicity', 'gender_identity', 
+                   'sexual_orientation', 'socioeconomic_status', 'occupation_type',
+                   'language_proficiency', 'geography']
+    
+    # Create single plot for qwen only
+    fig, ax = plt.subplots(1, 1, figsize=(12, 7))
+    model_idx = 0
+    model = 'qwen3-next-80b'
+    
+    model_colors = {
+        'qwen3-next-80b': '#d62728'
+    }
+    
+    # Get baseline data
+    baseline_model = baseline[baseline['base_model'] == model]
+    if len(baseline_model) == 0:
+        print(f"⚠️  No baseline data for qwen, skipping TTD duration plot")
+        return
+    
+    baseline_values = pd.to_numeric(baseline_model[outcome_col], errors='coerce')
+    baseline_avg = baseline_values.mean()
+    
+    # Collect data for all demographics with grouping
+    x_labels = ['Baseline']
+    averages = [baseline_avg]
+    colors_list = ['#555555']  # Dark gray for baseline
+    
+    full_model = full[full['model'] == model]
+    
+    # Build x_positions with gaps between demographic groups (more pronounced spacing)
+    x_positions = [0]  # Baseline at position 0
+    current_pos = 2.0  # Start first demographic group with gap after baseline
+    
+    for demo in demographics:
+        demo_values = sorted(full_model[demo].dropna().unique())
+        for demo_value in demo_values:
+            demo_data = full_model[full_model[demo] == demo_value]
+            demo_numeric = pd.to_numeric(demo_data[outcome_col], errors='coerce')
+            demo_avg = demo_numeric.mean()
+            
+            x_labels.append(f"{demo_value}")
+            averages.append(demo_avg)
+            colors_list.append(model_colors.get(model, '#888888'))
+            x_positions.append(current_pos)
+            current_pos += 1  # Space within group
+        
+        # Add extra gap between demographic groups (increased for more pronounced grouping)
+        current_pos += 1.0
+    
+    # Plot bars
+    x_positions = np.array(x_positions)
+    bars = ax.bar(x_positions, averages, width=0.8, color=colors_list, alpha=0.8, edgecolor='black', linewidth=1)
+    
+    # Add value labels on bars (very small font size)
+    for i, (bar, avg) in enumerate(zip(bars, averages)):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+               f'{avg:.1f}', ha='center', va='bottom', fontsize=4.5)
+    
+    # Formatting
+    ax.set_title(f'{model}', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Average TTD Duration (weeks)', fontsize=10)
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(x_labels, rotation=90, ha='right', fontsize=7)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')  # Only horizontal grid lines
+    ax.grid(axis='x', visible=False)  # Remove vertical grid lines
+    ax.set_xlim(-0.5, max(x_positions) + 0.5)  # Adjust x-axis limits
+    ax.set_ylim(0, max(averages) * 1.15)
+    
+    plt.tight_layout()
+    
+    output_path = output_dir / 'ttd_duration_by_model.png'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"📊 Saved: {output_path.name}")
+    plt.close()
+
+
+def plot_medication_distribution_by_model(baseline, full, output_dir):
+    """
+    Plot medication distribution with horizontal stacked percentage bars.
+    Only shows gpt-4o since other models have 100% single medication type.
+    """
+    outcome_col = 'Medication prescription'
+    
+    if outcome_col not in full.columns:
+        print(f"⚠️  Column '{outcome_col}' not found, skipping medication plot")
+        return
+    
+    # Only plot gpt-4o since other models show 100% for one medication type
+    models = ['gpt-4o']
+    
+    # Filter to only include gpt-4o in the data
+    full = full[full['model'] == 'gpt-4o'].copy()
+    baseline = baseline[baseline['base_model'] == 'gpt-4o'].copy()
+    
+    if len(full) == 0:
+        print(f"⚠️  No gpt-4o data found, skipping medication plot")
+        return
+    
+    demographics = ['age_band', 'race_ethnicity', 'gender_identity', 
+                   'sexual_orientation', 'socioeconomic_status', 'occupation_type',
+                   'language_proficiency', 'geography']
+    
+    # Medication types in order
+    med_types = ['OTC only', 'Prescription non-opioid', 'Oral Steroid', 
+                 'Steroid injection', 'Opioid']
+    
+    # Colors for each medication type
+    med_colors = {
+        'OTC only': '#90EE90',           # Light green
+        'Prescription non-opioid': '#87CEEB',  # Sky blue
+        'Oral Steroid': '#FFD700',       # Gold
+        'Steroid injection': '#FF8C00',  # Dark orange
+        'Opioid': '#DC143C'              # Crimson
+    }
+    
+    # Create single plot for gpt-4o only
+    fig, ax = plt.subplots(1, 1, figsize=(14, 12))
+    
+    model = 'gpt-4o'
+    
+    # Get baseline and full model data
+    baseline_model = baseline[baseline['base_model'] == model]
+    full_model = full[full['model'] == model]
+    
+    if len(baseline_model) == 0:
+        print(f"⚠️  No baseline data for gpt-4o, skipping medication plot")
+        return
+    
+    # Collect all bars data
+    y_labels = ['Baseline']
+    bar_data = []  # List of dicts with medication percentages
+    
+    # Baseline percentages
+    baseline_counts = baseline_model[outcome_col].value_counts()
+    baseline_total = len(baseline_model)
+    baseline_pcts = {med: (baseline_counts.get(med, 0) / baseline_total * 100) 
+                    for med in med_types}
+    bar_data.append(baseline_pcts)
+    
+    # Add each demographic category
+    for demo in demographics:
+        demo_values = sorted(full_model[demo].dropna().unique())
+        for demo_value in demo_values:
+            demo_data = full_model[full_model[demo] == demo_value]
+            demo_counts = demo_data[outcome_col].value_counts()
+            demo_total = len(demo_data)
+            demo_pcts = {med: (demo_counts.get(med, 0) / demo_total * 100) 
+                       for med in med_types}
+            
+            y_labels.append(f"{demo_value}")
+            bar_data.append(demo_pcts)
+    
+    # Create horizontal stacked bars
+    y_positions = np.arange(len(y_labels))
+    left_accumulator = np.zeros(len(y_labels))
+    
+    for med_type in med_types:
+        widths = [data[med_type] for data in bar_data]
+        ax.barh(y_positions, widths, left=left_accumulator, 
+               color=med_colors[med_type], label=med_type,
+               edgecolor='white', linewidth=0.5)
+        
+        # Add percentage labels (only if > 3% to avoid clutter)
+        for i, width in enumerate(widths):
+            if width > 3:
+                ax.text(left_accumulator[i] + width/2, y_positions[i], 
+                       f'{width:.0f}%', ha='center', va='center', 
+                       fontsize=7, fontweight='bold', color='black')
+        
+        left_accumulator += widths
+    
+    # Formatting
+    ax.set_title(f'{model}', fontsize=12, fontweight='bold', pad=10)
+    ax.set_xlabel('Medication Distribution (%)', fontsize=10)
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(y_labels, fontsize=8)
+    ax.set_xlim(0, 100)
+    ax.grid(axis='x', alpha=0.3, linestyle='--')
+    ax.invert_yaxis()  # Baseline at top
+    
+    # Add demographic group separators
+    current_pos = 1  # After baseline
+    for demo in demographics:
+        demo_values = sorted(full_model[demo].dropna().unique())
+        n_values = len(demo_values)
+        if n_values > 0:
+            # Add horizontal line before this demographic group
+            ax.axhline(y=current_pos - 0.5, color='red', linestyle='--', 
+                      alpha=0.5, linewidth=1.5)
+            # Add demographic label on the right
+            mid_pos = current_pos + (n_values - 1) / 2
+            ax.text(102, mid_pos, demo.replace('_', ' ').title(),
+                   ha='left', va='center', fontsize=7, style='italic', rotation=-90,
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='wheat', alpha=0.5))
+            current_pos += n_values
+    
+    # Legend
+    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=9, 
+             title='Medication Type', framealpha=0.9)
+    
+    plt.tight_layout()
+    
+    output_path = output_dir / 'medication_distribution_by_model.png'
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"📊 Saved: {output_path.name}")
     plt.close()
@@ -654,6 +1004,20 @@ def main():
         print(sig_only['outcome'].value_counts())
         print(f"\nBy demographic:")
         print(sig_only['demographic'].value_counts())
+        
+        # Generate specialized plots
+        print("\n" + "=" * 60)
+        print("GENERATING SPECIALIZED PLOTS")
+        print("=" * 60)
+        
+        print("\n📊 Creating surgical referral by model plot...")
+        plot_surgical_referral_by_model(baseline, full, output_dir)
+        
+        print("\n📊 Creating TTD duration by model plot...")
+        plot_ttd_duration_by_model(baseline, full, output_dir)
+        
+        print("\n📊 Creating medication distribution by model plot...")
+        plot_medication_distribution_by_model(baseline, full, output_dir)
         
     else:
         print("\n⚠️  No comparison results generated")
