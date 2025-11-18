@@ -32,6 +32,7 @@ show_usage() {
     echo "PROFILES:"
     echo "  test        - Quick CPU test (5 samples, 2 iterations)"
     echo "  small       - Small CPU test (50 samples, 3 iterations)"
+    echo "  pure        - Pure demographics only (32 samples, 5 iterations) - RECOMMENDED"
     echo "  medium      - Medium GPU test (500 samples, 5 iterations)"
     echo "  large       - Large GPU run (2304 samples, 10 iterations)"
     echo "  setup       - Run setup test only"
@@ -75,12 +76,58 @@ case $PROFILE in
         echo "NVIDIA NeMo RL requires GPU for training."
         echo ""
         echo "Available profiles:"
+        echo "  - pure: 32 samples (demographics only) - RECOMMENDED"
         echo "  - medium: 500 samples on GPU"
         echo "  - large: 2304 samples (full factorial) on GPU"
         echo ""
         echo "Or use on Brev/cloud GPU service"
         echo "="*80
         exit 1
+        ;;
+    
+    pure)
+        echo "Running PURE DEMOGRAPHICS profile:"
+        echo "  - Model: meta/llama-3.3-70b-instruct (Dense 70B, vLLM compatible!)"
+        echo "  - Design: PURE demographics (race/gender/orientation ONLY)"
+        echo "  - Samples: 32 vignettes (4 races × 4 genders × 2 orientations)"
+        echo "  - Iterations: 5"
+        echo "  - Device: CUDA (GPU required)"
+        echo "  - LoRA rank: 64"
+        echo "  - vLLM: ENABLED (fast inference)"
+        echo "  - Time: ~10-15 minutes"
+        echo ""
+        echo "This design isolates PURE demographic bias:"
+        echo "  - ZERO confounding contextual factors"
+        echo "  - Only race/gender/orientation in the prompt"
+        echo "  - All 32 demographic combinations tested"
+        echo "  - Perfect for measuring demographic parity"
+        echo ""
+        
+        # Check CUDA availability
+        python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            echo "❌ CUDA not available. This profile requires GPU."
+            exit 1
+        fi
+        
+        read -p "Continue? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 0
+        fi
+        
+        # Set memory optimization environment variables
+        export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+        
+        python train_grpo_nemo.py \
+            --model-name meta/llama-3.3-70b-instruct \
+            --pure-demographics \
+            --iterations 5 \
+            --lora-rank 64 \
+            --batch-size 2 \
+            --use-vllm \
+            --output-dir grpo_checkpoints_pure \
+            "$@"
         ;;
     
     medium)
