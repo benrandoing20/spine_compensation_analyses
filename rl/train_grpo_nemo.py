@@ -57,6 +57,7 @@ import config
 
 # Import dependencies (silently for Ray workers)
 import torch
+from torch import nn
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, set_seed
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
@@ -264,6 +265,94 @@ class RacialDisparityMetrics:
         
         return float(gini)
     
+    def compute_field_fairness_penalties(
+        self,
+        outputs: List[str],
+        demographics: List[Dict],
+        output_probs: List[Dict] = None,
+        lambda_kl: float = 1.0,
+        lambda_grad: float = 0.5,
+    ) -> Tuple[List[Dict[str, float]], List[Dict]]:
+        """
+        FIELD-SPECIFIC FAIRNESS: Compute per-field KL and Gradient penalties.
+        
+        This enables token-specific loss - each field's tokens get their own fairness signal.
+        
+        Args:
+            outputs: List of generated text responses
+            demographics: List of demographic dicts
+            output_probs: List of probability dicts for each output
+            lambda_kl: Weight for KL fairness penalty
+            lambda_grad: Weight for gradient fairness penalty
+        
+        Returns:
+            field_penalties: List of dicts mapping field_name -> penalty
+            parsed_outputs: List of parsed output dicts
+        """
+        print(f"\n[Computing per-field fairness penalties]")
+        print(f"   lambda_KL={lambda_kl}, lambda_Grad={lambda_grad}")
+        
+        # Fallback probabilities
+        if output_probs is None:
+            print("   [WARNING] No probabilities provided, using uniform distributions")
+            output_probs = [_uniform_field_probs() for _ in outputs]
+        
+        # Organize by scenario
+        scenarios = self._organize_by_scenario(outputs, demographics)
+        print(f"   Found {len(scenarios)} unique scenarios")
+        
+        # Parse all outputs
+        parsed_outputs = []
+        for output_text in outputs:
+            try:
+                cleaned = self.clean_json_output(output_text)
+                parsed = json.loads(cleaned)
+            except:
+                parsed = {}
+            parsed_outputs.append(parsed)
+        
+        # Compute per-field penalties for each sample
+        field_penalties_list = []
+        
+        for idx, (output_text, demo, parsed, probs) in enumerate(zip(outputs, demographics, parsed_outputs, output_probs)):
+            # Find scenario
+            scenario_key = self._get_scenario_key(demo)
+            scenario_data = scenarios.get(scenario_key, {})
+            
+            # Initialize field penalties
+            field_penalties = {}
+            
+            if not parsed or len(parsed) == 0:
+                # Failed parse - penalize all fields equally
+                for field in ['Medication prescription', 'work_status', 'physical_therapy', 
+                             'mental_health_referral', 'surgical_referral']:
+                    field_penalties[field] = 10.0  # High penalty
+            else:
+                # Compute per-field penalties
+                output_vectors = self._output_to_category_vectors(parsed)
+                
+                for field_name, field_vector in output_vectors.items():
+                    # KL penalty for this field
+                    kl_penalty = self._compute_field_kl_penalty(
+                        field_name, field_vector, scenario_data, parsed_outputs
+                    )
+                    
+                    # Gradient penalty for this field
+                    grad_penalty = self._compute_field_gradient_penalty(
+                        field_name, field_vector, probs, scenario_data, parsed_outputs, output_probs
+                    )
+                    
+                    # Combined penalty for this field
+                    field_penalties[field_name] = lambda_kl * kl_penalty + lambda_grad * grad_penalty
+            
+            field_penalties_list.append(field_penalties)
+        
+        # Log statistics
+        parse_rate = sum(1 for p in parsed_outputs if p) / len(parsed_outputs) if parsed_outputs else 0
+        print(f"   Parse rate: {parse_rate:.2%} ({sum(1 for p in parsed_outputs if p)}/{len(parsed_outputs)})")
+        
+        return field_penalties_list, parsed_outputs
+    
     def compute_fairness_reward(
         self,
         outputs: List[str],
@@ -274,7 +363,9 @@ class RacialDisparityMetrics:
         lambda_entropy: float = 0.3
     ) -> List[float]:
         """
-        REWARD FUNCTION: Compute per-query rewards based on fairness metrics.
+        BACKWARD COMPATIBLE: Compute per-query rewards (aggregated from field penalties).
+        
+        Note: For token-specific training, use compute_field_fairness_penalties() instead.
         
         This implements a novel fairness approach using:
         1. KL fairness: Penalize outputs that differ from scenario average
@@ -359,6 +450,10 @@ class RacialDisparityMetrics:
             
             rewards.append(query_reward)
         
+        # [DEBUG] Optional reward clipping for stability
+        # Note: This should be done AFTER advantages are computed in train_step
+        # So we don't clip here, just log if values are extreme
+        
         # Print diagnostic info
         parse_rate = n_parsed / len(outputs) if len(outputs) > 0 else 0
         print(f"   Parse rate: {parse_rate:.2%} ({n_parsed}/{len(outputs)})")
@@ -371,6 +466,16 @@ class RacialDisparityMetrics:
         
         print(f"\n   Final Reward stats: mean={np.mean(rewards):.4f}, std={np.std(rewards):.4f}")
         print(f"   Reward range: [{np.min(rewards):.4f}, {np.max(rewards):.4f}]")
+        
+        # [DEBUG] RED FLAG CHECKS - Reward scale issues
+        reward_std = np.std(rewards)
+        reward_range = np.max(rewards) - np.min(rewards)
+        if reward_std > 20:
+            print(f"   [RED FLAG] HIGH REWARD STD: {reward_std:.2f} (consider clipping or reducing lambda)")
+        if reward_range > 100:
+            print(f"   [RED FLAG] HUGE REWARD RANGE: {reward_range:.2f} (may cause instability)")
+        if np.abs(np.mean(rewards)) > 50:
+            print(f"   [RED FLAG] EXTREME REWARD MEAN: {np.mean(rewards):.2f} (very skewed distribution)")
         
         # Show sample outputs for debugging
         if n_parsed < len(outputs) * 0.5:
@@ -630,6 +735,109 @@ class RacialDisparityMetrics:
             n_fields += 1
         
         return total_grad_penalty / max(n_fields, 1)
+    
+    def _compute_field_kl_penalty(
+        self,
+        field_name: str,
+        field_vector: np.ndarray,
+        scenario_data: Dict,
+        all_parsed_outputs: List[Dict]
+    ) -> float:
+        """
+        Compute KL divergence penalty for a SINGLE field.
+        
+        This enables token-specific penalties - each field gets its own fairness signal.
+        """
+        if not scenario_data or 'indices' not in scenario_data:
+            return 0.0
+        
+        scenario_indices = scenario_data['indices']
+        if len(scenario_indices) < 2:
+            return 0.0
+        
+        # Collect this field's vectors across all demographics in scenario
+        field_vectors = []
+        for idx in scenario_indices:
+            if idx < len(all_parsed_outputs):
+                parsed = all_parsed_outputs[idx]
+                if parsed:
+                    vectors = self._output_to_category_vectors(parsed)
+                    if field_name in vectors:
+                        field_vectors.append(vectors[field_name])
+        
+        if len(field_vectors) < 2:
+            return 0.0
+        
+        # Average distribution for this field across demographics
+        avg_field_vec = np.mean(field_vectors, axis=0)
+        
+        # JS divergence for this field only
+        epsilon = 1e-8
+        query_dist = field_vector + epsilon
+        avg_dist = avg_field_vec + epsilon
+        
+        query_dist = query_dist / query_dist.sum()
+        avg_dist = avg_dist / avg_dist.sum()
+        
+        m = (query_dist + avg_dist) / 2
+        js_div = 0.5 * np.sum(query_dist * np.log(query_dist / m)) + \
+                 0.5 * np.sum(avg_dist * np.log(avg_dist / m))
+        
+        return float(js_div)
+    
+    def _compute_field_gradient_penalty(
+        self,
+        field_name: str,
+        field_vector: np.ndarray,
+        output_probs: Dict[str, np.ndarray],
+        scenario_data: Dict,
+        all_parsed_outputs: List[Dict],
+        all_output_probs: List[Dict]
+    ) -> float:
+        """
+        Compute gradient fairness penalty for a SINGLE field.
+        
+        TRUE gradient: g = one_hot - prob_vector
+        Penalty: L2 distance from average gradient across demographics.
+        """
+        if not scenario_data or 'indices' not in scenario_data:
+            return 0.0
+        
+        scenario_indices = scenario_data['indices']
+        if len(scenario_indices) < 2:
+            return 0.0
+        
+        # Compute TRUE gradients for this field across demographics
+        field_grads = []
+        for idx in scenario_indices:
+            if idx < len(all_parsed_outputs) and idx < len(all_output_probs):
+                parsed = all_parsed_outputs[idx]
+                probs = all_output_probs[idx]
+                
+                if parsed:
+                    vectors = self._output_to_category_vectors(parsed)
+                    if field_name in vectors:
+                        one_hot = vectors[field_name]
+                        prob_dist = probs.get(field_name, one_hot)  # Fallback to one-hot
+                        
+                        # TRUE gradient
+                        grad = one_hot - prob_dist
+                        field_grads.append(grad)
+        
+        if len(field_grads) < 2:
+            return 0.0
+        
+        # Average gradient for this field
+        avg_grad = np.mean(field_grads, axis=0)
+        
+        # This query's gradient
+        query_prob = output_probs.get(field_name, field_vector)
+        query_grad = field_vector - query_prob
+        
+        # L2 squared distance
+        grad_penalty = np.linalg.norm(query_grad - avg_grad) ** 2
+        
+        return float(grad_penalty)
     
     def _compute_entropy_reward(self, output_probs: Dict[str, np.ndarray]) -> float:
         """
@@ -1068,7 +1276,6 @@ def _extract_field_probs_from_scores(
     """
     # Parse the generated text to find field values
     try:
-        from . import config
         cleaned = RacialDisparityMetrics.clean_json_output(generated_text)
         parsed = json.loads(cleaned)
     except:
@@ -1310,11 +1517,323 @@ def generate_batch_vllm(vllm_engine: 'LLM', prompts: List[str], lora_path: Optio
     return responses, prob_dicts
 
 
+def compute_behavior_distribution(responses: List[str], clean_json_func) -> Dict:
+    """
+    Compute distribution of decisions across all outputs for behavior tracking.
+    Returns percentages for each field/value combination.
+    """
+    from collections import defaultdict
+    
+    behavior = defaultdict(lambda: defaultdict(int))
+    parsed_count = 0
+    
+    for response in responses:
+        try:
+            cleaned = clean_json_func(response)
+            parsed = json.loads(cleaned)
+            parsed_count += 1
+            
+            # Track each field
+            for field, value in parsed.items():
+                if field not in ['rationale_25words_max', 'vignette_id']:
+                    behavior[field][str(value)] += 1
+        except:
+            continue
+    
+    # Convert to percentages
+    behavior_pct = {}
+    for field, counts in behavior.items():
+        total = sum(counts.values())
+        if total > 0:
+            behavior_pct[field] = {val: 100 * count / total for val, count in counts.items()}
+    
+    return behavior_pct
+
+
+def compute_behavior_drift(prev_behavior: Dict, curr_behavior: Dict) -> float:
+    """
+    Compute total variation distance between two behavior distributions.
+    Returns average drift across all fields (0-100%).
+    """
+    if not prev_behavior or not curr_behavior:
+        return 0.0
+    
+    total_drift = 0
+    num_fields = 0
+    
+    for field in prev_behavior:
+        if field in curr_behavior:
+            prev_dist = prev_behavior[field]
+            curr_dist = curr_behavior[field]
+            
+            # Get all possible values
+            all_values = set(prev_dist.keys()) | set(curr_dist.keys())
+            
+            # Total variation distance
+            field_drift = sum(
+                abs(curr_dist.get(val, 0) - prev_dist.get(val, 0))
+                for val in all_values
+            ) / 2  # Divide by 2 for TV distance
+            
+            total_drift += field_drift
+            num_fields += 1
+    
+    return total_drift / num_fields if num_fields > 0 else 0.0
+
+
+def train_step_field_specific(model, tokenizer, optimizer, prompts: List[str], responses: List[str],
+                              field_penalties: List[Dict[str, float]], parsed_outputs: List[Dict],
+                              demographics: List[Dict] = None,
+                              max_train_samples: int = 100, micro_batch_size: int = 2):
+    """
+    TOKEN-SPECIFIC training step with per-field advantages.
+    
+    This is the NOVEL approach: instead of applying one reward to the entire sequence,
+    we compute field-specific penalties and apply different advantages to different tokens
+    based on which output field they correspond to.
+    
+    Args:
+        field_penalties: List of dicts mapping field_name -> penalty for each sample
+        parsed_outputs: List of parsed JSON outputs  
+        demographics: Optional list of demographic dicts
+        max_train_samples: Maximum samples to train on
+        micro_batch_size: Micro-batch size
+        
+    Returns:
+        total_weighted_loss, avg_base_loss
+    """
+    model.train()
+    
+    # Convert field penalties to scalar rewards for sampling (use mean)
+    scalar_rewards = []
+    for penalties in field_penalties:
+        if penalties:
+            avg_penalty = np.mean(list(penalties.values()))
+            scalar_rewards.append(-avg_penalty)  # Negative because penalties
+        else:
+            scalar_rewards.append(-10.0)  # Failed parse
+    
+    rewards_np = np.array(scalar_rewards)
+    n_samples = min(max_train_samples, len(prompts))
+    
+    # Sample training examples
+    if len(prompts) > max_train_samples:
+        top_n = int(n_samples * 0.4)
+        bottom_n = int(n_samples * 0.4)
+        random_n = n_samples - top_n - bottom_n
+        
+        top_indices = np.argsort(rewards_np)[-top_n:]
+        bottom_indices = np.argsort(rewards_np)[:bottom_n]
+        remaining = set(range(len(prompts))) - set(top_indices) - set(bottom_indices)
+        random_indices = np.random.choice(list(remaining), random_n, replace=False)
+        
+        train_indices = np.concatenate([top_indices, bottom_indices, random_indices])
+        np.random.shuffle(train_indices)
+        
+        train_prompts = [prompts[i] for i in train_indices]
+        train_responses = [responses[i] for i in train_indices]
+        train_field_penalties = [field_penalties[i] for i in train_indices]
+        train_parsed = [parsed_outputs[i] for i in train_indices]
+        
+        print(f"  [Training] Using {len(train_indices)}/{len(prompts)} samples (top/bottom/random)")
+    else:
+        train_prompts = prompts
+        train_responses = responses
+        train_field_penalties = field_penalties
+        train_parsed = parsed_outputs
+    
+    # Prepare full texts
+    full_texts = [p + r for p, r in zip(train_prompts, train_responses)]
+    
+    # Training loop
+    total_loss = 0.0
+    total_weighted_loss = 0.0
+    num_micro_batches = (len(full_texts) + micro_batch_size - 1) // micro_batch_size
+    
+    optimizer.zero_grad()
+    
+    for i in tqdm(range(0, len(full_texts), micro_batch_size),
+                  desc="  Training LoRA (field-specific)",
+                  total=num_micro_batches):
+        batch_texts = full_texts[i:i+micro_batch_size]
+        batch_prompts = train_prompts[i:i+micro_batch_size]
+        batch_responses = train_responses[i:i+micro_batch_size]
+        batch_penalties = train_field_penalties[i:i+micro_batch_size]
+        batch_parsed = train_parsed[i:i+micro_batch_size]
+        
+        # Tokenize (consistent add_special_tokens=False to avoid demographic token leakage)
+        inputs = tokenizer(
+            batch_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=1024,
+            add_special_tokens=False  # Consistent with prompt tokenization below
+        )
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        
+        # Create labels with token-specific advantages
+        labels = inputs['input_ids'].clone()
+        token_advantages = torch.zeros_like(labels, dtype=torch.float32)
+        
+        for idx, (prompt, response, penalties, parsed) in enumerate(zip(batch_prompts, batch_responses, batch_penalties, batch_parsed)):
+            # Tokenize prompt to get accurate length (consistent with full text tokenization)
+            prompt_tokens = tokenizer(prompt, add_special_tokens=False)['input_ids']
+            prompt_len = len(prompt_tokens)
+            
+            # Mask prompt tokens
+            labels[idx, :prompt_len] = -100
+            
+            # Parse response to find field token boundaries
+            if parsed and penalties:
+                field_token_map = _map_fields_to_tokens(response, parsed, tokenizer)
+                
+                # Compute per-field advantages
+                field_advs = {}
+                penalty_values = list(penalties.values())
+                if len(penalty_values) > 0:
+                    penalty_mean = np.mean(penalty_values)
+                    penalty_std = np.std(penalty_values) + 1e-8
+                    
+                    for field, penalty in penalties.items():
+                        # Convert penalty to advantage (negative because penalty)
+                        field_advs[field] = -(penalty - penalty_mean) / penalty_std
+                
+                # Assign field-specific advantages to tokens
+                for field, (start_pos, end_pos) in field_token_map.items():
+                    if field in field_advs:
+                        adv = field_advs[field]
+                        # Apply advantage to this field's tokens
+                        token_start = prompt_len + start_pos
+                        token_end = prompt_len + end_pos
+                        token_advantages[idx, token_start:token_end] = adv
+            else:
+                # Failed parse - apply uniform negative advantage
+                token_advantages[idx, prompt_len:] = -2.0
+        
+        # Move to device
+        token_advantages = token_advantages.to(model.device)
+        
+        # Forward pass
+        outputs = model(**inputs, labels=labels)
+        
+        # Compute token-specific weighted loss
+        # We need to compute loss per token and weight by advantages
+        logits = outputs.logits
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        shift_advantages = token_advantages[..., 1:].contiguous()
+        
+        # Compute per-token loss
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        token_losses = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1)
+        ).view(shift_labels.size())
+        
+        # Apply token-specific advantages
+        # CRITICAL: Use negative sign for gradient ascent (maximize high advantages)
+        # Positive advantage (good) → negative loss → gradient descent increases it
+        # Negative advantage (bad) → positive loss → gradient descent decreases it
+        mask = (shift_labels != -100).float()
+        weighted_token_losses = -token_losses * shift_advantages * mask  # NEGATIVE SIGN!
+        
+        # Average over valid tokens
+        batch_loss = weighted_token_losses.sum() / (mask.sum() + 1e-8)
+        base_loss = (token_losses * mask).sum() / (mask.sum() + 1e-8)
+        
+        # Normalize by number of batches
+        batch_loss = batch_loss / num_micro_batches
+        
+        # Backward
+        batch_loss.backward()
+        
+        total_loss += base_loss.item()
+        total_weighted_loss += batch_loss.item()
+        
+        # Free memory
+        del inputs, outputs, logits, token_losses, weighted_token_losses
+        torch.cuda.empty_cache()
+    
+    # Update weights
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    
+    # Debug output
+    print(f"\n  [Gradient norm] {grad_norm:.6f}")
+    if grad_norm > 10:
+        print(f"  [RED FLAG] HIGH GRADIENT NORM: {grad_norm:.2f}")
+    if grad_norm < 0.001:
+        print(f"  [RED FLAG] VANISHING GRADIENTS: {grad_norm:.6f}")
+    
+    avg_base_loss = total_loss / num_micro_batches
+    print(f"  [Loss] Weighted={total_weighted_loss:.6f}, Base={avg_base_loss:.6f}")
+    
+    return total_weighted_loss, avg_base_loss
+
+
+def _map_fields_to_tokens(response: str, parsed: Dict, tokenizer) -> Dict[str, Tuple[int, int]]:
+    """
+    Map output fields to their token positions in the response.
+    
+    Returns dict mapping field_name -> (start_token_idx, end_token_idx)
+    """
+    # Map JSON keys to normalized field names (must match _output_to_category_vectors)
+    NAME_MAP = {
+        "Medication prescription": "medication",
+        "work_status": "work_status",
+        "physical_therapy": "physical_therapy",
+        "mental_health_referral": "mental_health",
+        "surgical_referral": "surgical",
+    }
+    
+    field_map = {}
+    
+    # Tokenize the full response
+    response_tokens = tokenizer(response, add_special_tokens=False)['input_ids']
+    
+    # For each field, find its approximate position in tokens
+    for field, value in parsed.items():
+        # Normalize field name to match field_penalties keys
+        norm_field = NAME_MAP.get(field)
+        if norm_field is None:
+            continue  # Skip unknown fields
+        # Find the field's text position
+        field_text = f'"{field}"'
+        value_text = json.dumps(value) if not isinstance(value, str) else f'"{value}"'
+        
+        # Find where this field appears in response
+        field_pos = response.find(field_text)
+        if field_pos == -1:
+            continue
+        
+        # Find end of this field's value
+        value_pos = response.find(value_text, field_pos)
+        if value_pos == -1:
+            continue
+        
+        # Convert character positions to approximate token positions
+        # This is approximate - we tokenize up to that point to count tokens
+        prefix_before_value = response[:value_pos]
+        prefix_tokens_count = len(tokenizer(prefix_before_value, add_special_tokens=False)['input_ids'])
+        
+        value_tokens = tokenizer(value_text, add_special_tokens=False)['input_ids']
+        value_token_count = len(value_tokens)
+        
+        # Store token range for this field's value (using normalized name)
+        field_map[norm_field] = (prefix_tokens_count, prefix_tokens_count + value_token_count)
+    
+    return field_map
+
+
 def train_step(model, tokenizer, optimizer, prompts: List[str], responses: List[str], 
                rewards: List[float], demographics: List[Dict] = None,
                clip_range: float = 0.2, max_train_samples: int = 100, micro_batch_size: int = 2):
     """
-    Single training step with per-query advantage computation.
+    LEGACY: Single training step with per-query advantage computation.
+    
+    Note: This applies one advantage to the entire sequence. For field-specific
+    training, use train_step_field_specific() instead.
     
     Args:
         demographics: Optional list of demographic dicts for balanced sampling
@@ -1370,6 +1889,16 @@ def train_step(model, tokenizer, optimizer, prompts: List[str], responses: List[
     print(f"  [Advantage stats] mean={advantages.mean():.4f}, std={advantages.std():.4f}")
     print(f"  [Advantage range] [{advantages.min():.4f}, {advantages.max():.4f}]")
     
+    # [DEBUG] RED FLAG CHECKS - Advantage normalization issues
+    adv_mean = advantages.mean().item()
+    adv_std = advantages.std().item()
+    if adv_std > 5:
+        print(f"  [RED FLAG] HIGH ADVANTAGE STD: {adv_std:.2f} (normalization may have failed)")
+    if adv_std < 0.5:
+        print(f"  [RED FLAG] LOW ADVANTAGE STD: {adv_std:.2f} (rewards have no variance, no learning signal)")
+    if abs(adv_mean) > 0.1:
+        print(f"  [RED FLAG] NON-ZERO ADVANTAGE MEAN: {adv_mean:.3f} (should be ~0 after normalization)")
+    
     # Process in micro-batches with gradient accumulation
     total_loss = 0.0
     total_weighted_loss = 0.0
@@ -1386,55 +1915,92 @@ def train_step(model, tokenizer, optimizer, prompts: List[str], responses: List[
         batch_prompts = train_prompts[i:i+micro_batch_size]
         batch_advantages = advantages[i:i+micro_batch_size]
         
-        # Tokenize micro-batch (full text for context)
+        # Tokenize prompts separately to get accurate lengths
+        # CRITICAL: Use add_special_tokens=False consistently to avoid off-by-one errors
+        prompt_encodings = tokenizer(
+            batch_prompts,
+            add_special_tokens=False,
+            padding=True,
+            truncation=True,
+            max_length=1024,
+            return_tensors="pt"
+        )
+        # Get prompt lengths (excluding padding)
+        prompt_lens = (prompt_encodings['input_ids'] != tokenizer.pad_token_id).sum(dim=1)
+        
+        # Tokenize full texts (with same settings as prompts)
         inputs = tokenizer(
             batch_texts, 
             return_tensors="pt", 
             padding=True, 
             truncation=True, 
-            max_length=1024
+            max_length=1024,
+            add_special_tokens=False  # Consistent with prompt tokenization
         )
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
         
         # CRITICAL: Mask prompt tokens so loss only applies to RESPONSE tokens
         # This ensures we don't train the model to associate demographics with outputs
         labels = inputs['input_ids'].clone()
-        for idx, prompt in enumerate(batch_prompts):
-            # Tokenize just the prompt to get its length
-            prompt_tokens = tokenizer(prompt, add_special_tokens=False)['input_ids']
-            prompt_len = len(prompt_tokens)
+        for idx, plen in enumerate(prompt_lens):
             # Mask prompt tokens with -100 (ignored in loss)
-            labels[idx, :prompt_len] = -100
+            labels[idx, :plen] = -100
         
-        # Forward pass with masked labels (loss only on response tokens)
+        # Forward pass (get logits, not aggregated loss)
         outputs = model(**inputs, labels=labels)
-        loss = outputs.loss
         
-        # Weight loss by per-sample advantages
-        # Positive advantage = good (maximize) = use negative loss to encourage
-        # Negative advantage = bad (minimize) = use positive loss to discourage
-        batch_advantage_weight = -batch_advantages.mean()  # Flip sign for gradient ascent
+        # Compute per-token losses (no reduction)
+        logits = outputs.logits[:, :-1, :].contiguous()
+        labels_shift = labels[:, 1:].contiguous()
         
-        # Scale by advantage and normalize by number of batches
-        weighted_loss = (loss * batch_advantage_weight) / num_micro_batches
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        token_losses = loss_fct(
+            logits.reshape(-1, logits.size(-1)),
+            labels_shift.reshape(-1)
+        ).view(labels_shift.size())  # [batch, seq_len]
+        
+        # Mask out -100 labels
+        mask = (labels_shift != -100).float()
+        
+        # Compute per-example loss
+        per_example_loss = (token_losses * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)  # [batch]
+        
+        # Apply per-example advantages (gradient ascent on reward)
+        batch_advantages_tensor = batch_advantages.to(per_example_loss.device)
+        weighted_per_example_loss = per_example_loss * (-batch_advantages_tensor)  # Negative for gradient ascent
+        
+        # Average over batch and normalize by num_micro_batches
+        batch_loss = weighted_per_example_loss.mean() / num_micro_batches
+        base_loss_value = per_example_loss.mean().item()
         
         # Backward pass (accumulate gradients)
-        weighted_loss.backward()
+        batch_loss.backward()
         
-        total_loss += loss.item()
-        total_weighted_loss += weighted_loss.item()
+        total_loss += base_loss_value
+        total_weighted_loss += batch_loss.item()
         
         # Free memory immediately after each micro-batch
-        del inputs, outputs, loss, weighted_loss
+        del inputs, outputs, logits, token_losses
         torch.cuda.empty_cache()
         
         batch_idx += 1
     
     # Update weights after accumulating all gradients
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     
-    return total_weighted_loss, total_loss / num_micro_batches
+    # [DEBUG] Gradient norm tracking
+    print(f"\n  [Gradient norm] {grad_norm:.6f}")
+    if grad_norm > 10:
+        print(f"  [RED FLAG] HIGH GRADIENT NORM: {grad_norm:.2f} (may indicate instability, consider lower LR)")
+    if grad_norm < 0.001:
+        print(f"  [RED FLAG] VANISHING GRADIENTS: {grad_norm:.6f} (learning may be stuck)")
+    
+    # [DEBUG] Loss tracking
+    avg_base_loss = total_loss / num_micro_batches
+    print(f"  [Loss] Weighted={total_weighted_loss:.6f}, Base={avg_base_loss:.6f}")
+    
+    return total_weighted_loss, avg_base_loss
 
 
 def main():
@@ -1542,9 +2108,20 @@ def main():
         help='Weight for entropy reward (rewards output diversity to prevent collapse)'
     )
     parser.add_argument(
+        '--clip-reward',
+        type=float,
+        default=None,
+        help='[DEBUG] Clip rewards to [-clip, +clip] for stability (e.g., 5.0). None = no clipping.'
+    )
+    parser.add_argument(
         '--pure-demographics',
         action='store_true',
         help='Use PURE demographic design (32 samples: only race/gender/orientation, no other attributes). Cleanest measurement of demographic bias.'
+    )
+    parser.add_argument(
+        '--field-specific-loss',
+        action='store_true',
+        help='[NOVEL] Use field-specific token loss: different tokens get different fairness signals based on which output field they belong to. Solves credit assignment problem.'
     )
     
     args = parser.parse_args()
@@ -1584,6 +2161,16 @@ def main():
     print(f"  λ_KL (fairness): {args.lambda_kl}")
     print(f"  λ_Grad (gradient): {args.lambda_grad}")
     print(f"  λ_Entropy (diversity): {args.lambda_entropy}")
+    print(f"\n[DEBUG] Enhanced diagnostics enabled:")
+    print(f"  - Reward scale tracking (red flags if std > 20)")
+    print(f"  - Advantage normalization checks (should be mean~0, std~1)")
+    print(f"  - Gradient norm monitoring (red flags if > 10)")
+    print(f"  - Behavior drift tracking (red flags if shift > 20%)")
+    print(f"  - Iteration-level change tracking")
+    if args.clip_reward is not None:
+        print(f"  - Reward clipping: [{-args.clip_reward}, {args.clip_reward}]")
+    else:
+        print(f"  - Reward clipping: DISABLED")
     if not args.no_wandb and WANDB_AVAILABLE:
         if args.wandb_entity:
             print(f"\nWandb: {args.wandb_entity}/{args.wandb_project}/{args.wandb_name}")
@@ -1730,6 +2317,7 @@ def main():
     
     # Training history
     history = []
+    prev_behavior = None  # [DEBUG] Track behavior changes between iterations
     
     print("\n" + "="*80)
     print("[STARTING FAIRNESS-AWARE RL TRAINING]")
@@ -1767,14 +2355,62 @@ def main():
         # Compute fairness metrics and rewards
         print("\n[Computing fairness metrics]")
         metrics = metrics_tracker.compute_racial_disparity(responses, vignettes)
-        rewards = metrics_tracker.compute_fairness_reward(
-            responses, 
-            vignettes,
-            output_probs=output_probs,  # Pass probabilities through
-            lambda_kl=args.lambda_kl,
-            lambda_grad=args.lambda_grad,
-            lambda_entropy=args.lambda_entropy
-        )
+        
+        # Choose training method: field-specific or legacy
+        if args.field_specific_loss:
+            # NOVEL: Compute per-field penalties for token-specific loss
+            field_penalties, parsed_outputs = metrics_tracker.compute_field_fairness_penalties(
+                responses,
+                vignettes,
+                output_probs=output_probs,
+                lambda_kl=args.lambda_kl,
+                lambda_grad=args.lambda_grad,
+            )
+            
+            # For logging, compute aggregate rewards from field penalties
+            rewards = []
+            for penalties in field_penalties:
+                if penalties:
+                    avg_penalty = np.mean(list(penalties.values()))
+                    rewards.append(-avg_penalty)
+                else:
+                    rewards.append(-10.0)
+        else:
+            # LEGACY: Compute scalar rewards (one per sample)
+            rewards = metrics_tracker.compute_fairness_reward(
+                responses, 
+                vignettes,
+                output_probs=output_probs,  # Pass probabilities through
+                lambda_kl=args.lambda_kl,
+                lambda_grad=args.lambda_grad,
+                lambda_entropy=args.lambda_entropy
+            )
+            field_penalties = None
+            parsed_outputs = None
+        
+        # [DEBUG] Optional reward clipping for stability (legacy mode only)
+        if args.clip_reward is not None and not args.field_specific_loss:
+            rewards_before = np.array(rewards)
+            rewards = np.clip(rewards, -args.clip_reward, args.clip_reward).tolist()
+            n_clipped = np.sum((rewards_before < -args.clip_reward) | (rewards_before > args.clip_reward))
+            if n_clipped > 0:
+                print(f"\n[DEBUG] Clipped {n_clipped}/{len(rewards)} rewards to [{-args.clip_reward}, {args.clip_reward}]")
+        
+        # [DEBUG] Track behavior changes
+        curr_behavior = compute_behavior_distribution(responses, metrics_tracker.clean_json_output)
+        if prev_behavior is not None:
+            behavior_drift = compute_behavior_drift(prev_behavior, curr_behavior)
+            print(f"\n[DEBUG] Behavior Change from Previous Iteration:")
+            print(f"  Total Drift: {behavior_drift:.2f}%")
+            
+            # RED FLAG CHECKS - Behavior stability
+            if behavior_drift > 50:
+                print(f"  [RED FLAG] MASSIVE BEHAVIOR SHIFT: {behavior_drift:.1f}% (model may be diverging)")
+            elif behavior_drift > 20:
+                print(f"  [RED FLAG] LARGE BEHAVIOR SHIFT: {behavior_drift:.1f}% (training may be too aggressive)")
+            elif behavior_drift < 1:
+                print(f"  [WARNING] MINIMAL CHANGE: {behavior_drift:.1f}% (model not learning, check LR/rewards)")
+        prev_behavior = curr_behavior
         
         # Training step (requires HF model)
         print("\n[Updating policy]")
@@ -1795,11 +2431,21 @@ def main():
             train_model, train_tokenizer = setup_model_and_tokenizer(args.model_name, args.lora_rank)
             train_optimizer = torch.optim.AdamW(train_model.parameters(), lr=args.learning_rate)
             
-            loss, base_loss = train_step(
-                train_model, train_tokenizer, train_optimizer, prompts, responses, rewards,
-                max_train_samples=args.max_train_samples,
-                micro_batch_size=args.micro_batch_size
-            )
+            # Choose training method: field-specific or legacy
+            if args.field_specific_loss:
+                loss, base_loss = train_step_field_specific(
+                    train_model, train_tokenizer, train_optimizer, 
+                    prompts, responses, field_penalties, parsed_outputs,
+                    max_train_samples=args.max_train_samples,
+                    micro_batch_size=args.micro_batch_size
+                )
+            else:
+                loss, base_loss = train_step(
+                    train_model, train_tokenizer, train_optimizer, 
+                    prompts, responses, rewards,
+                    max_train_samples=args.max_train_samples,
+                    micro_batch_size=args.micro_batch_size
+                )
             
             # Save LoRA adapter (for potential future use)
             checkpoint_path = Path(args.output_dir) / f"checkpoint_iter{iteration + 1}"
@@ -1881,6 +2527,15 @@ def main():
         print(f"  Disparity Ratio: {metrics['disparity/ratio']:.4f}")
         print(f"  Gini Coefficient: {metrics['disparity/gini']:.4f}")
         print(f"  Parse Rate: {metrics['parse_rate']:.2%}")
+        
+        # [DEBUG] Cross-iteration diagnostics
+        if iteration > 0:
+            prev_metrics = history[iteration - 1]
+            print(f"\n  [DEBUG] Changes from Previous Iteration:")
+            print(f"    Loss:            {loss:.4f} -> {loss - prev_metrics['loss']:+.4f}")
+            print(f"    Reward Mean:     {prev_metrics['reward_mean']:.4f} -> {np.mean(rewards):.4f} ({np.mean(rewards) - prev_metrics['reward_mean']:+.4f})")
+            print(f"    Disparity Ratio: {prev_metrics['disparity/ratio']:.4f} -> {metrics['disparity/ratio']:.4f} ({metrics['disparity/ratio'] - prev_metrics['disparity/ratio']:+.4f})")
+            print(f"    Gini Coeff:      {prev_metrics['disparity/gini']:.4f} -> {metrics['disparity/gini']:.4f} ({metrics['disparity/gini'] - prev_metrics['disparity/gini']:+.4f})")
         
         # Wandb logging
         if wandb_enabled:
