@@ -49,6 +49,11 @@ Return ONLY a valid JSON object in the exact format below with one answer per qu
 # Model Configurations
 MODELS = {
     # OpenAI Models
+    "gpt-5": {
+        "provider": "openai",
+        "model_id": "gpt-5",
+        "tier": "commercial"
+    },
     "gpt-5-mini": {
         "provider": "openai",
         "model_id": "gpt-5-mini",

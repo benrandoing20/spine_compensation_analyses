@@ -470,6 +470,181 @@ def calculate_average_marginal_effects(full, outcome_col, demographic_col, model
         return None
 
 
+def train_logistic_regression_with_significance(full, model_name):
+    """
+    Train logistic regression models using statsmodels to get p-values and confidence intervals.
+    Returns coefficients with statistical significance for each outcome.
+    
+    Baseline categories (dropped to avoid multicollinearity):
+    - White (race_ethnicity)
+    - cisgender man (gender_identity)
+    - heterosexual (sexual_orientation)
+    - upper class (socioeconomic_status)
+    - white collar (occupation_type)
+    - English proficient (language_proficiency)
+    - urban (geography)
+    - young (age_band)
+    """
+    baseline_categories = {
+        'race_ethnicity': 'White',
+        'gender_identity': 'cisgender man',
+        'sexual_orientation': 'heterosexual',
+        'socioeconomic_status': 'upper class',
+        'occupation_type': 'white collar',
+        'language_proficiency': 'English proficient',
+        'geography': 'urban',
+        'age_band': 'young'
+    }
+    
+    # Filter to specific model
+    full_model = full[full['model'] == model_name].copy()
+    
+    # Define all outcomes to model
+    outcomes = [
+        'Medication prescription',
+        'surgical_referral'
+    ]
+    
+    # Check for TTD duration column
+    ttd_col_options = [
+        'ttd_duration_weeks',
+        'If Off work/Temporary Total Disability, duration in weeks',
+        'TTD_duration_weeks'
+    ]
+    ttd_col_name = None
+    for ttd_col in ttd_col_options:
+        if ttd_col in full_model.columns:
+            outcomes.append(ttd_col)
+            ttd_col_name = ttd_col
+            break
+    
+    demographics = ['age_band', 'race_ethnicity', 'gender_identity', 
+                   'sexual_orientation', 'socioeconomic_status', 'occupation_type',
+                   'language_proficiency', 'geography']
+    
+    results = {}
+    
+    for outcome in outcomes:
+        if outcome not in full_model.columns:
+            logging.warning(f"  ⚠️  Outcome '{outcome}' not found in data, skipping...")
+            continue
+        
+        logging.info(f"\n  Training logistic regression for: {outcome}")
+        
+        # Prepare data
+        data = full_model[demographics + [outcome]].copy()
+        data = data.dropna()
+        
+        if len(data) < 50:
+            logging.warning(f"    ⚠️  Insufficient data ({len(data)} rows), skipping...")
+            continue
+        
+        # Handle outcome encoding
+        if outcome == ttd_col_name:
+            # TTD: binary (0 weeks vs >0 weeks)
+            data[outcome] = pd.to_numeric(data[outcome], errors='coerce')
+            data = data.dropna(subset=[outcome])
+            y = (data[outcome] > 0).astype(int)
+            outcome_label = f"{outcome} (>0 weeks)"
+        elif outcome == 'Medication prescription':
+            # Binary: Pick most common non-OTC class vs others
+            med_counts = data[outcome].value_counts()
+            # Try in order of clinical relevance
+            for target_med in ['Opioid', 'Steroid injection', 'Oral Steroid', 'Prescription non-opioid']:
+                if target_med in med_counts.index and med_counts[target_med] >= 50:
+                    y = (data[outcome] == target_med).astype(int)
+                    outcome_label = f"Medication prescription ({target_med})"
+                    logging.info(f"    Modeling '{target_med}' (n={med_counts[target_med]}) vs others")
+                    break
+            else:
+                # If none of the target meds have enough data, skip
+                logging.warning(f"    ⚠️  No medication class with sufficient data (n>=50), skipping...")
+                continue
+        elif outcome == 'surgical_referral':
+            # Binary: Yes vs No
+            y = (data[outcome] == 'Yes').astype(int)
+            outcome_label = "Surgical Referral (Yes)"
+        else:
+            # Generic binary handling
+            unique_vals = data[outcome].unique()
+            if len(unique_vals) == 2:
+                y = (data[outcome] == unique_vals[0]).astype(int)
+                outcome_label = f"{outcome} ({unique_vals[0]})"
+            else:
+                logging.warning(f"    ⚠️  Outcome has {len(unique_vals)} classes, skipping...")
+                continue
+        
+        # Create dummy variables
+        X = pd.DataFrame()
+        for demo in demographics:
+            dummies = pd.get_dummies(data[demo], prefix=demo, drop_first=False)
+            baseline_col = f"{demo}_{baseline_categories[demo]}"
+            if baseline_col in dummies.columns:
+                dummies = dummies.drop(columns=[baseline_col])
+            X = pd.concat([X, dummies], axis=1)
+        
+        # Convert all columns to numeric (statsmodels requires this)
+        X = X.astype(float)
+        
+        # Add constant for statsmodels
+        X = sm.add_constant(X)
+        X = X.loc[y.index]
+        
+        # Ensure y is also numeric
+        y = y.astype(float)
+        
+        # Check for sufficient variation
+        if y.sum() < 10 or (len(y) - y.sum()) < 10:
+            logging.warning(f"    ⚠️  Insufficient variation in outcome, skipping...")
+            continue
+        
+        # Fit statsmodels Logit
+        try:
+            logit_model = sm.Logit(y, X)
+            result = logit_model.fit(disp=0, maxiter=100)
+            
+            # Extract results
+            coef_df = pd.DataFrame({
+                'feature': result.params.index,
+                'coefficient': result.params.values,
+                'std_error': result.bse.values,
+                'z_score': result.tvalues.values,
+                'p_value': result.pvalues.values,
+                'ci_lower': result.conf_int()[0].values,
+                'ci_upper': result.conf_int()[1].values,
+                'odds_ratio': np.exp(result.params.values),
+                'or_ci_lower': np.exp(result.conf_int()[0].values),
+                'or_ci_upper': np.exp(result.conf_int()[1].values)
+            })
+            
+            # Add significance stars
+            coef_df['significance'] = coef_df['p_value'].apply(
+                lambda p: '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else ''
+            )
+            
+            # Add metadata
+            coef_df['model'] = model_name
+            coef_df['outcome'] = outcome_label
+            coef_df['n_samples'] = len(y)
+            coef_df['pseudo_r2'] = result.prsquared
+            
+            # Remove constant from display
+            coef_df = coef_df[coef_df['feature'] != 'const'].copy()
+            
+            # Sort by p-value
+            coef_df = coef_df.sort_values('p_value')
+            
+            results[outcome] = coef_df
+            
+            logging.info(f"    ✓ Fitted with {len(coef_df)} coefficients, Pseudo R²={result.prsquared:.4f}")
+            
+        except Exception as e:
+            logging.warning(f"    ⚠️  Error fitting model: {e}")
+            continue
+    
+    return results
+
+
 def train_logistic_regression_models(full, model_name):
     """
     Train logistic regression models for each outcome using all demographics as features.
@@ -680,6 +855,103 @@ def train_logistic_regression_models(full, model_name):
     return results
 
 
+def save_logistic_regression_with_significance(all_lr_results, output_dir):
+    """
+    Save logistic regression results with full statistical details including p-values,
+    confidence intervals, and significance markers.
+    """
+    if not all_lr_results:
+        return
+    
+    # Combine all results
+    lr_combined = pd.concat(all_lr_results, ignore_index=True)
+    
+    # Save full detailed results
+    output_file = output_dir / 'logistic_regression_with_significance.csv'
+    lr_combined.to_csv(output_file, index=False)
+    logging.info(f"\n✅ Logistic Regression with Significance saved: {output_file}")
+    logging.info(f"   Columns: coefficient, std_error, p_value, CI, odds_ratio, significance")
+    
+    # Get unique outcomes
+    outcomes = lr_combined['outcome'].unique()
+    
+    for outcome in outcomes:
+        outcome_data = lr_combined[lr_combined['outcome'] == outcome].copy()
+        
+        logging.info(f"\n{'='*80}")
+        logging.info(f"LOGISTIC REGRESSION: {outcome}")
+        logging.info(f"{'='*80}")
+        logging.info(f"Reference categories: White, cisgender man, heterosexual, upper class,")
+        logging.info(f"                     white collar, English proficient, urban, young")
+        logging.info("")
+        
+        # Create coefficient pivot table
+        coef_pivot = outcome_data.pivot_table(
+            index='model',
+            columns='feature',
+            values='coefficient',
+            aggfunc='first'
+        )
+        
+        # Create p-value pivot table
+        pval_pivot = outcome_data.pivot_table(
+            index='model',
+            columns='feature',
+            values='p_value',
+            aggfunc='first'
+        )
+        
+        # Create significance pivot table
+        sig_pivot = outcome_data.pivot_table(
+            index='model',
+            columns='feature',
+            values='significance',
+            aggfunc='first'
+        )
+        
+        # Save individual tables
+        safe_outcome_name = outcome.replace(' ', '_').replace('/', '_').replace(',', '').replace('(', '').replace(')', '').lower()
+        
+        coef_file = output_dir / f'lr_coefficients_{safe_outcome_name}.csv'
+        coef_pivot.to_csv(coef_file)
+        logging.info(f"Coefficients: {coef_file}")
+        
+        pval_file = output_dir / f'lr_pvalues_{safe_outcome_name}.csv'
+        pval_pivot.to_csv(pval_file)
+        logging.info(f"P-values: {pval_file}")
+        
+        sig_file = output_dir / f'lr_significance_{safe_outcome_name}.csv'
+        sig_pivot.to_csv(sig_file)
+        logging.info(f"Significance: {sig_file}")
+        
+        # Create combined table with coefficients and significance
+        combined_table = coef_pivot.copy()
+        for col in combined_table.columns:
+            for idx in combined_table.index:
+                coef_val = combined_table.loc[idx, col]
+                if pd.notna(coef_val):
+                    sig_val = sig_pivot.loc[idx, col] if (idx in sig_pivot.index and col in sig_pivot.columns) else ''
+                    pval = pval_pivot.loc[idx, col] if (idx in pval_pivot.index and col in pval_pivot.columns) else ''
+                    combined_table.loc[idx, col] = f"{coef_val:.3f}{sig_val} (p={pval:.4f})" if pd.notna(pval) else f"{coef_val:.3f}{sig_val}"
+        
+        combined_file = output_dir / f'lr_combined_{safe_outcome_name}.csv'
+        combined_table.to_csv(combined_file)
+        logging.info(f"Combined (coef + sig): {combined_file}")
+        
+        # Display significant findings
+        sig_results = outcome_data[outcome_data['p_value'] < 0.05].sort_values('p_value')
+        if len(sig_results) > 0:
+            logging.info(f"\nSignificant coefficients (α=0.05): {len(sig_results)}")
+            for _, row in sig_results.head(15).iterrows():
+                logging.info(f"  {row['model']}: {row['feature']}")
+                logging.info(f"    Coef={row['coefficient']:.4f} {row['significance']}, " 
+                           f"OR={row['odds_ratio']:.4f} [{row['or_ci_lower']:.4f}-{row['or_ci_upper']:.4f}], "
+                           f"p={row['p_value']:.4f}")
+        else:
+            logging.info(f"\nNo significant coefficients at α=0.05")
+        logging.info("")
+
+
 def create_formatted_logistic_regression_tables(all_lr_results, output_dir, models_list):
     """
     Create simple pivot tables for logistic regression results.
@@ -888,14 +1160,23 @@ def main():
                                      f"AME={row['AME']:.4f} ({row['AME_ci_lower']:.4f} to {row['AME_ci_upper']:.4f}), "
                                      f"p={row['p_value']:.4f} | {row['interpretation']}")
         
-        # ===== LOGISTIC REGRESSION WITH HYPERPARAMETER TUNING =====
-        logging.info("\n\n🤖 Training Logistic Regression Models (with hyperparameter search)...")
-        lr_results = train_logistic_regression_models(full, model)
+        # ===== LOGISTIC REGRESSION WITH SIGNIFICANCE TESTING =====
+        logging.info("\n\n📊 Training Logistic Regression with Statistical Significance...")
+        lr_sig_results = train_logistic_regression_with_significance(full, model)
         
-        if lr_results:
-            for outcome, coef_df in lr_results.items():
+        if lr_sig_results:
+            for outcome, coef_df in lr_sig_results.items():
                 all_logistic_regression.append(coef_df)
-                logging.info(f"\n  ✓ {outcome}: Trained successfully")
+                
+                # Display significant results
+                sig_results = coef_df[coef_df['p_value'] < 0.05].copy()
+                if len(sig_results) > 0:
+                    logging.info(f"\n  ✓ {outcome}: {len(sig_results)} significant coefficients")
+                    for _, row in sig_results.head(10).iterrows():
+                        logging.info(f"    • {row['feature']}: coef={row['coefficient']:.4f}, "
+                                   f"OR={row['odds_ratio']:.4f}, p={row['p_value']:.4f} {row['significance']}")
+                else:
+                    logging.info(f"\n  ✓ {outcome}: No significant coefficients at α=0.05")
     
     # ===== SAVE ALL RESULTS =====
     logging.info("\n\n" + "=" * 80)
@@ -951,8 +1232,14 @@ def main():
         logging.info(f"   Total coefficients: {len(lr_combined)}")
         logging.info(f"   Outcomes analyzed: {lr_combined['outcome'].nunique()}")
         
-        # Create formatted coefficient tables (pivot tables)
-        create_formatted_logistic_regression_tables(all_logistic_regression, output_dir, models)
+        # Check if we have significance data (from new function)
+        if 'p_value' in lr_combined.columns:
+            # Save with full significance details
+            save_logistic_regression_with_significance(all_logistic_regression, output_dir)
+            logging.info(f"   Significant coefficients (α=0.05): {(lr_combined['p_value'] < 0.05).sum()}")
+        else:
+            # Legacy format without p-values
+            create_formatted_logistic_regression_tables(all_logistic_regression, output_dir, models)
     
     logging.info("\n" + "=" * 80)
     logging.info("✅ ENHANCED ANALYSIS COMPLETE")

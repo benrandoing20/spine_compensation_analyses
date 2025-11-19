@@ -19,10 +19,11 @@ import pandas as pd
 from tqdm import tqdm
 
 import sys
-sys.path.append(str(Path(__file__).parent.parent))
+# Add project root to path (go up two levels from this file to get to project root)
+sys.path.append(str(Path(__file__).parent.parent.parent))
 
-import config
-from llm_execution.llm_providers import query_model
+from src import config
+from src.llm_execution.llm_providers import query_model
 
 # Setup logging
 logging.basicConfig(

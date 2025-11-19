@@ -27,10 +27,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent))
+# Add project root to path (go up two levels from this file to get to project root)
+sys.path.append(str(Path(__file__).parent.parent.parent))
 
-import config
-from llm_execution.llm_providers import query_model
+from src import config
+from src.llm_execution.llm_providers import query_model
 
 # Setup logging
 logging.basicConfig(
@@ -152,7 +153,7 @@ def main():
     # Default models - all available models
     if args.models is None:
         args.models = [
-            # "gpt-5-mini",            # OpenAI latest (Aug 2025)
+            "gpt-5",       # OpenAI GPT-5 (Nov 2024)
             "gpt-4o",           # OpenAI
             # "gpt-oss-20b",      # NVIDIA
             "llama-3.3-70b",    # Meta Llama (fixed missing comma)

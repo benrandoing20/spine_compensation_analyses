@@ -8,13 +8,18 @@ ENV/
 logs/
 *.log
 
-# Analysis outputs
-analysis/results/
-analysis/enhanced_output/
-analysis/comparison/
+# Analysis outputs - keep final results but ignore intermediate files
+analysis/results/*/results_partial_*
+analysis/results/*/results_checkpoint_*
+!analysis/results/merged_results.csv
+!analysis/results/merged_results.json
 
-# Visualization plots
-visualization/plots/
+# Keep manuscript figures but ignore detailed outputs
+!analysis/comparison/medication_distribution_by_model.png
+!analysis/comparison/surgical_referral_by_model.png
+!analysis/comparison/ttd_duration_by_model.png
+analysis/comparison/*.csv
+analysis/enhanced_output/*.csv
 
 # RL checkpoints
 rl/grpo_checkpoints_test/
