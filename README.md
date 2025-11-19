@@ -2,7 +2,7 @@
 
 Research code for evaluating demographic biases in Large Language Models (LLMs) when making clinical recommendations for workers' compensation spine injury cases.
 
-## 📁 Repository Structure
+## Repository Structure
 
 ```
 spine_compensation_analyses/
@@ -20,21 +20,48 @@ spine_compensation_analyses/
 │   ├── compare_to_baseline.py         # Generate manuscript figures
 │   └── enhanced_analysis.py           # Logistic regression analysis
 │
-└── analysis/                          # Data and outputs
-    ├── results/
-    │   └── merged_results.csv         # Combined experiment data
-    ├── comparison/                    # Output: manuscript figures
-    │   ├── medication_distribution_by_model.png
-    │   ├── surgical_referral_by_model.png
-    │   └── ttd_duration_by_model.png
-    └── enhanced_output/               # Output: statistical results
-        ├── lr_combined_*.csv          # Logistic regression results
-        ├── lr_coefficients_*.csv      # Model coefficients
-        ├── lr_pvalues_*.csv           # P-values
-        └── lr_significance_*.csv      # Significance markers
+├── logs/                              # Created during runtime
+│   ├── baseline_batch_*.log           # Baseline experiment logs
+│   ├── batch_*.log                    # Demographic experiment logs
+│   └── enhanced_analysis/             # Enhanced analysis logs
+│       └── *.log                      # Statistical analysis run logs
+│
+└── analysis/                          # Created/populated during runtime
+    ├── results/                       # Populated by run_baseline.py and run_experiment.py
+    │   ├── baseline-{model}/          # Per-model baseline results
+    │   │   └── results_final_*.csv    # 3 queries per model
+    │   ├── {model}/                   # Per-model demographic results
+    │   │   ├── results_final_*.csv    # 6,912 queries per model
+    │   │   └── results_checkpoint_*.json  # Auto-save checkpoints (deleted after merge)
+    │   ├── merged_results.csv         # Created by merge_results.py (~20,736 rows)
+    │   └── merged_results.json        # JSON version of merged results
+    │
+    ├── comparison/                    # Populated by compare_to_baseline.py
+    │   ├── baseline_comparison_detailed.csv
+    │   ├── baseline_comparison_significant.csv
+    │   ├── surgical_referral_by_model.png     # Manuscript figure 1
+    │   ├── ttd_duration_by_model.png          # Manuscript figure 2
+    │   └── medication_distribution_by_model.png  # Manuscript figure 3
+    │
+    └── enhanced_output/               # Populated by enhanced_analysis.py
+        ├── lr_combined_*.csv          # 3 files: Coef + p-val + sig (main outcomes)
+        ├── lr_coefficients_*.csv      # 3 files: Coefficients only (main outcomes)
+        ├── lr_pvalues_*.csv           # 3 files: P-values only (main outcomes)
+        ├── lr_significance_*.csv      # 3 files: Significance markers (main outcomes)
+        ├── logistic_regression_coef_*.csv    # 7 files: All outcomes (one file per outcome)
+        ├── logistic_regression_coef_ALL_OUTCOMES.csv  # Master table (all outcomes)
+        ├── logistic_regression_with_significance.csv  # Full detailed results
+        ├── odds_ratios_all.csv
+        ├── odds_ratios_significant.csv
+        ├── average_marginal_effects.csv
+        ├── average_marginal_effects_significant.csv
+        ├── medication_group_comparisons_all.csv
+        └── medication_group_comparisons_significant.csv
 ```
 
-## 🚀 Quick Start
+**Note:** The `logs/` and `analysis/` directories are created automatically when you run the scripts. Initially, only `src/`, `README.md`, and `requirements.txt` are present in a fresh clone.
+
+## Quick Start
 
 ### 1. Installation
 
@@ -74,12 +101,19 @@ NVIDIA_API_KEY=nvapi-your-key-here
 ```bash
 # Run baseline (no demographics) - ~1 minute
 python src/llm_execution/run_baseline.py
+# Creates: analysis/results/baseline-{model}/results_final_*.csv
+# Creates: logs/baseline_batch_*.log
 
 # Run full experiment - ~4 hours per model
 python src/llm_execution/run_experiment.py --models gpt-4o
+# Creates: analysis/results/{model}/results_final_*.csv
+# Creates: analysis/results/{model}/results_checkpoint_*.json (every 50 queries)
+# Creates: logs/batch_*.log
 
 # Merge all results
 python src/llm_execution/merge_results.py
+# Creates: analysis/results/merged_results.csv
+# Creates: analysis/results/merged_results.json
 ```
 
 ### 4. Generate Manuscript Figures
@@ -92,12 +126,17 @@ source venv/bin/activate
 python src/compare_to_baseline.py \
   analysis/results/merged_results.csv \
   --output analysis/comparison
+# Creates: analysis/comparison/surgical_referral_by_model.png
+# Creates: analysis/comparison/ttd_duration_by_model.png
+# Creates: analysis/comparison/medication_distribution_by_model.png
+# Creates: analysis/comparison/baseline_comparison_detailed.csv
+# Creates: analysis/comparison/baseline_comparison_significant.csv
 ```
 
 **Output:** Three publication-ready figures in `analysis/comparison/`:
-1. **`surgical_referral_by_model.png`** - Surgical referral rates by demographics
-2. **`ttd_duration_by_model.png`** - Temporary total disability duration
-3. **`medication_distribution_by_model.png`** - Medication prescription patterns
+1. **Surgical referral by model** - Surgical referral rates by demographics
+2. **TTD duration by model** - Temporary total disability duration
+3. **Medication distribution by model** - Medication prescription patterns
 
 ### 5. Run Statistical Analysis
 
@@ -106,15 +145,37 @@ python src/compare_to_baseline.py \
 python src/enhanced_analysis.py \
   analysis/results/merged_results.csv \
   --output analysis/enhanced_output
+# Creates: analysis/enhanced_output/lr_combined_*.csv (3 files: surgical, TTD, medication)
+# Creates: analysis/enhanced_output/lr_coefficients_*.csv (3 files: separated tables)
+# Creates: analysis/enhanced_output/lr_pvalues_*.csv (3 files: separated tables)
+# Creates: analysis/enhanced_output/lr_significance_*.csv (3 files: separated tables)
+# Creates: analysis/enhanced_output/logistic_regression_coef_*.csv (8 files: 7 outcomes + master)
+# Creates: analysis/enhanced_output/logistic_regression_with_significance.csv (1 file: all results)
+# Creates: analysis/enhanced_output/odds_ratios_*.csv (2 files: all + significant)
+# Creates: analysis/enhanced_output/average_marginal_effects*.csv (2 files: all + significant)
+# Creates: analysis/enhanced_output/medication_group_comparisons_*.csv (2 files: all + significant)
+# Creates: logs/enhanced_analysis/*.log
+# Total: 27 CSV files
 ```
 
 **Output:** Statistical analysis files in `analysis/enhanced_output/`:
-- `lr_combined_*.csv` - Full regression results with CIs
-- `lr_coefficients_*.csv` - Model coefficients
-- `lr_pvalues_*.csv` - P-values for all predictors
-- `lr_significance_*.csv` - Significance markers (*, **, ***)
 
-## 📊 Experimental Design
+**For manuscript tables (recommended):**
+- `lr_combined_*.csv` (3 files) - Best for tables: coefficients + p-values + significance in one table
+  - One file each for: surgical referral, TTD duration, medication prescription
+
+**For detailed analysis:**
+- `lr_coefficients_*.csv`, `lr_pvalues_*.csv`, `lr_significance_*.csv` - Separated views of the same 3 main outcomes
+- `logistic_regression_coef_*.csv` (7 files) - Individual files for all 7 outcomes
+- `logistic_regression_coef_ALL_OUTCOMES.csv` - Master table with all outcomes
+- `logistic_regression_with_significance.csv` - Complete detailed results
+
+**For effect sizes:**
+- `odds_ratios_all.csv` / `odds_ratios_significant.csv` - Pairwise demographic comparisons
+- `average_marginal_effects.csv` / `average_marginal_effects_significant.csv` - AME for each demographic
+- `medication_group_comparisons_all.csv` / `medication_group_comparisons_significant.csv` - Medication analyses
+
+## Experimental Design
 
 ### Models Tested
 - **gpt-4o** (OpenAI GPT-4 Omni)
@@ -148,7 +209,7 @@ Standardized L5-S1 disc herniation case:
 - Workers' compensation context
 - No red flags or contraindications
 
-## 📈 Key Outputs
+## Key Outputs
 
 ### Figure 1: Surgical Referral by Demographics
 `analysis/comparison/surgical_referral_by_model.png`
@@ -183,7 +244,7 @@ Logistic regression results for each outcome:
 - P-values and significance levels
 - Standard errors and z-statistics
 
-## 🔧 Script Reference
+## Script Reference
 
 ### Core Workflow Scripts
 
@@ -226,7 +287,7 @@ Options:
   --test                        Quick test mode (10 vignettes)
 ```
 
-## 📝 Reproducing Analyses
+## Reproducing Analyses
 
 ### Using Pre-Computed Results
 The repository includes pre-computed results (`analysis/results/merged_results.csv`). To regenerate figures:
@@ -257,7 +318,7 @@ python src/compare_to_baseline.py analysis/results/merged_results.csv
 python src/enhanced_analysis.py analysis/results/merged_results.csv
 ```
 
-## 🔍 Statistical Methods
+## Statistical Methods
 
 ### Significance Testing
 - **Individual comparisons:** Chi-squared tests comparing each demographic group to baseline
@@ -272,7 +333,7 @@ python src/enhanced_analysis.py analysis/results/merged_results.csv
 - `††` ANOVA/Chi-squared p < 0.01
 - `†††` ANOVA/Chi-squared p < 0.001
 
-## 📦 Dependencies
+## Dependencies
 
 Core requirements (see `requirements.txt`):
 - `pandas` - Data manipulation
@@ -284,7 +345,7 @@ Core requirements (see `requirements.txt`):
 - `openai` - OpenAI API
 - `python-dotenv` - Environment variables
 
-## ⚠️ Notes
+## Notes
 
 ### File Sizes
 - `merged_results.csv`: ~50MB (20,736 rows × 18 columns)
@@ -302,7 +363,7 @@ Core requirements (see `requirements.txt`):
 - Llama-3.3-70b: Free (NVIDIA API)
 - Qwen3-Next-80b: Free (NVIDIA API)
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### "ModuleNotFoundError: No module named 'pandas'"
 ```bash
@@ -334,7 +395,7 @@ NVIDIA_API_KEY=nvapi-...
 python llm_execution/run_experiment.py --models gpt-4o --delay 1.5
 ```
 
-## 📚 Citation
+## Citation
 
 If you use this code or data, please cite:
 
@@ -348,11 +409,11 @@ If you use this code or data, please cite:
 }
 ```
 
-## 📄 License
+## License
 
 [MIT License / Your chosen license]
 
-## 👥 Contact
+## Contact
 
 For questions or issues:
 - GitHub Issues: https://github.com/yourusername/spine_compensation_analyses/issues
