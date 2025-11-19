@@ -54,6 +54,50 @@ def calculate_rates(df, group_cols, outcome_col):
     return df.groupby(group_cols)[outcome_col].value_counts(normalize=True).unstack(fill_value=0)
 
 
+def calculate_anova_for_demographic(full, baseline, outcome_col, demographic_col, model_name, outcome_value):
+    """
+    Calculate ANOVA to test if there's a significant difference across all demographic values
+    within a demographic category for a specific outcome value.
+    
+    For example: Tests if surgical referral rate differs significantly across 
+    all race_ethnicity groups (Asian, Black, Hispanic, White) as a whole.
+    """
+    # Filter to specific model
+    full_model = full[full['model'] == model_name]
+    baseline_model = baseline[baseline['base_model'] == model_name]
+    
+    if len(baseline_model) == 0 or len(full_model) == 0:
+        return None
+    
+    # Get groups for each demographic value
+    groups = []
+    for demo_value in sorted(full_model[demographic_col].dropna().unique()):
+        demo_data = full_model[full_model[demographic_col] == demo_value]
+        # Create binary outcome (1 if matches outcome_value, 0 otherwise)
+        binary_outcome = (demo_data[outcome_col] == outcome_value).astype(int).values
+        if len(binary_outcome) > 0:
+            groups.append(binary_outcome)
+    
+    if len(groups) < 2:
+        return None
+    
+    # Perform one-way ANOVA across all demographic groups
+    try:
+        f_stat, p_value = stats.f_oneway(*groups)
+        return {
+            'model': model_name,
+            'demographic': demographic_col,
+            'outcome': outcome_col,
+            'outcome_value': outcome_value,
+            'f_statistic': f_stat,
+            'p_value': p_value,
+            'n_groups': len(groups),
+            'significant': p_value < 0.05
+        }
+    except:
+        return None
+
+
 def compare_to_baseline(full, baseline, outcome_col, demographic_col, model_name):
     """Compare demographic-specific rates to baseline for a given model."""
     
@@ -560,6 +604,30 @@ def plot_surgical_referral_by_model(baseline, full, output_dir):
                    'sexual_orientation', 'socioeconomic_status', 'occupation_type',
                    'language_proficiency', 'geography']
     
+    # Define significant demographics from baseline comparison
+    significant_surgical = {
+        'gpt-4o': {
+            'age_band': {'young': '*'},
+            'gender_identity': {'transgender man': '*'},
+            'language_proficiency': {'English non-proficient': '*'},
+            'occupation_type': {'blue collar': '*'},
+            'race_ethnicity': {'Black': '*', 'Hispanic or Latino': '*'},
+            'sexual_orientation': {'homosexual': '*'},
+            'socioeconomic_status': {'middle class': '*'}
+        },
+        'llama-3.3-70b': {},  # No significant differences
+        'qwen3-next-80b': {
+            'age_band': {'old': '***', 'young': '***'},
+            'gender_identity': {'cisgender man': '**', 'cisgender woman': '***', 'transgender man': '***'},
+            'geography': {'rural': '***', 'suburban': '***', 'urban': '***'},
+            'language_proficiency': {'English non-proficient': '***'},
+            'occupation_type': {'white collar': '***'},
+            'race_ethnicity': {'Asian': '***', 'Black': '***', 'Hispanic or Latino': '***'},
+            'sexual_orientation': {'heterosexual': '***', 'homosexual': '***'},
+            'socioeconomic_status': {'lower class': '***', 'middle class': '***'}
+        }
+    }
+    
     # Create triangle arrangement: 2 plots on top, 1 centered below (same size)
     fig = plt.figure(figsize=(20, 12))
     gs = fig.add_gridspec(2, 4, hspace=0.3, wspace=0.3)
@@ -614,21 +682,43 @@ def plot_surgical_referral_by_model(baseline, full, output_dir):
         
         full_model = full[full['model'] == model]
         
+        # Calculate ANOVA for each demographic category
+        anova_results = {}
+        for demo in demographics:
+            anova_result = calculate_anova_for_demographic(full, baseline, outcome_col, demo, model, target_value)
+            if anova_result and anova_result['significant']:
+                anova_results[demo] = anova_result['p_value']
+        
         # Build x_positions with gaps between demographic groups (more pronounced spacing)
         x_positions = [0]  # Baseline at position 0
         current_pos = 2.0  # Start first demographic group with gap after baseline
+        significance_markers = [(0, None)]  # Store (position, stars) for plotting above bars - baseline has no stars
+        demographic_ranges = {}  # Store start and end positions for each demographic
         
         for demo in demographics:
             demo_values = sorted(full_model[demo].dropna().unique())
+            demo_start = current_pos
             for demo_value in demo_values:
                 demo_data = full_model[full_model[demo] == demo_value]
                 demo_pct = (demo_data[outcome_col] == target_value).mean() * 100
                 
-                x_labels.append(f"{demo_value}")
+                # Check for significance markers (case-insensitive)
+                stars = None
+                if model in significant_surgical and demo in significant_surgical[model]:
+                    for sig_value, star_text in significant_surgical[model][demo].items():
+                        if demo_value.lower() == sig_value.lower():
+                            stars = star_text
+                            break
+                
+                x_labels.append(demo_value.title())  # Capitalize for consistent display
                 percentages.append(demo_pct)
                 colors_list.append(model_colors.get(model, '#888888'))
                 x_positions.append(current_pos)
+                significance_markers.append((current_pos, stars))  # Store for later
                 current_pos += 1  # Space within group
+            
+            demo_end = current_pos - 1
+            demographic_ranges[demo] = (demo_start, demo_end)
             
             # Add extra gap between demographic groups (increased for more pronounced grouping)
             current_pos += 1.0
@@ -643,6 +733,56 @@ def plot_surgical_referral_by_model(baseline, full, output_dir):
             ax.text(bar.get_x() + bar.get_width()/2., height + 0.3,
                    f'{pct:.1f}', ha='center', va='bottom', fontsize=4.5)
         
+        # Add significance markers above bars
+        for i, (pos, stars) in enumerate(significance_markers):
+            if stars:
+                height = percentages[i]
+                ax.text(pos, height + 0.8, stars,  # Reduced to 0.8 for closer positioning
+                       ha='center', va='bottom', fontsize=8, fontweight='bold', color='black')
+        
+        # Add ANOVA horizontal bars for significant demographic categories
+        for demo, (start_pos, end_pos) in demographic_ranges.items():
+            if demo in anova_results:
+                # Get the max height in this demographic group
+                demo_indices = [i for i, pos in enumerate(x_positions) if start_pos <= pos <= end_pos]
+                max_height = max([percentages[i] for i in demo_indices])
+                
+                # Draw horizontal bar higher above the tallest bar to avoid asterisk overlap
+                bar_y = max_height + 3.8  # Positioned above asterisks
+                line_y = max_height + 3.2  # Positioned above asterisks
+                ax.plot([start_pos - 0.4, end_pos + 0.4], [line_y, line_y], 
+                       color='black', linewidth=1.5, linestyle='-')
+                
+                # Add vertical ticks at ends
+                ax.plot([start_pos - 0.4, start_pos - 0.4], [line_y - 0.3, line_y + 0.3], 
+                       color='black', linewidth=1.5)
+                ax.plot([end_pos + 0.4, end_pos + 0.4], [line_y - 0.3, line_y + 0.3], 
+                       color='black', linewidth=1.5)
+                
+                # Add dagger symbol for ANOVA significance
+                p_val = anova_results[demo]
+                if p_val < 0.001:
+                    symbol = '†††'
+                elif p_val < 0.01:
+                    symbol = '††'
+                else:
+                    symbol = '†'
+                
+                ax.text((start_pos + end_pos) / 2, bar_y, symbol, 
+                       ha='center', va='bottom', fontsize=10, fontweight='bold', color='black')
+        
+        # Calculate adjusted y-max to accommodate ANOVA bars
+        max_anova_height = 0
+        for demo, (start_pos, end_pos) in demographic_ranges.items():
+            if demo in anova_results:
+                demo_indices = [i for i, pos in enumerate(x_positions) if start_pos <= pos <= end_pos]
+                if demo_indices:
+                    max_height = max([percentages[i] for i in demo_indices])
+                    max_anova_height = max(max_anova_height, max_height + 3.8 + 1.0)  # bar_y + padding
+        
+        # Use the larger of global_y_max or max_anova_height
+        adjusted_y_max = max(global_y_max, max_anova_height) if max_anova_height > 0 else global_y_max
+        
         # Formatting
         ax.set_title(f'{model}', fontsize=13, fontweight='bold')
         # Show ylabel on left plots (idx 0 and 2)
@@ -652,8 +792,14 @@ def plot_surgical_referral_by_model(baseline, full, output_dir):
         ax.set_xticklabels(x_labels, rotation=90, ha='right', fontsize=7)
         ax.grid(axis='y', alpha=0.3, linestyle='--')  # Only horizontal grid lines
         ax.grid(axis='x', visible=False)  # Remove vertical grid lines
-        ax.set_ylim(0, global_y_max)  # Shared y-axis scale across all subplots
+        ax.set_ylim(0, adjusted_y_max)  # Adjusted y-axis scale to fit ANOVA bars
         ax.set_xlim(-0.5, max(x_positions) + 0.5)  # Adjust x-axis limits
+    
+    # Add significance notes
+    fig.text(0.02, 0.02, '* p < 0.05, ** p < 0.01, *** p < 0.001 (compared to baseline)', 
+            fontsize=9, style='italic', ha='left', va='bottom')
+    fig.text(0.02, 0.005, '† p < 0.05, †† p < 0.01, ††† p < 0.001 (ANOVA across demographic group)', 
+            fontsize=9, style='italic', ha='left', va='bottom')
     
     output_path = output_dir / 'surgical_referral_by_model.png'
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -663,9 +809,9 @@ def plot_surgical_referral_by_model(baseline, full, output_dir):
 
 def plot_ttd_duration_by_model(baseline, full, output_dir):
     """
-    Plot average TTD duration - only showing qwen results.
+    Plot average TTD duration with triangle arrangement for all three models.
     X-axis: demographic factors grouped by demographic type
-    Y-axis: average TTD duration in weeks
+    Y-axis: average TTD duration in weeks (independent scales for better visibility)
     """
     outcome_col = 'If Off work/Temporary Total Disability, duration in weeks'
     
@@ -673,85 +819,334 @@ def plot_ttd_duration_by_model(baseline, full, output_dir):
         print(f"⚠️  Column '{outcome_col}' not found, skipping TTD duration plot")
         return
     
-    # Only show qwen results
-    models = ['qwen3-next-80b']
-    
-    # Filter data to only qwen
-    full = full[full['model'].isin(models)].copy()
-    baseline = baseline[baseline['base_model'].isin(models)].copy()
-    
-    if len(full) == 0:
-        print(f"⚠️  No qwen data found, skipping TTD duration plot")
-        return
-    
+    models = sorted(full['model'].unique())
     demographics = ['age_band', 'race_ethnicity', 'gender_identity', 
                    'sexual_orientation', 'socioeconomic_status', 'occupation_type',
                    'language_proficiency', 'geography']
     
-    # Create single plot for qwen only
-    fig, ax = plt.subplots(1, 1, figsize=(12, 7))
-    model_idx = 0
-    model = 'qwen3-next-80b'
+    # Define significant demographics for TTD duration (all are ***)
+    significant_ttd = {
+        'gpt-4o': {},  # No significant differences
+        'llama-3.3-70b': {
+            # All demographics are significant (***)
+            'age_band': {'old': '***', 'young': '***'},
+            'gender_identity': {'cisgender man': '***', 'cisgender woman': '***', 'transgender man': '***', 'transgender woman': '***'},
+            'geography': {'rural': '***', 'suburban': '***', 'urban': '***'},
+            'language_proficiency': {'English non-proficient': '***', 'English proficient': '***'},
+            'occupation_type': {'blue collar': '***', 'white collar': '***'},
+            'race_ethnicity': {'Asian': '***', 'Black': '***', 'Hispanic or Latino': '***', 'White': '***'},
+            'sexual_orientation': {'heterosexual': '***', 'homosexual': '***'},
+            'socioeconomic_status': {'lower class': '***', 'middle class': '***', 'upper class': '***'}
+        },
+        'qwen3-next-80b': {
+            # All demographics are significant (***)
+            'age_band': {'old': '***', 'young': '***'},
+            'gender_identity': {'cisgender man': '***', 'cisgender woman': '***', 'transgender man': '***', 'transgender woman': '***'},
+            'geography': {'rural': '***', 'suburban': '***', 'urban': '***'},
+            'language_proficiency': {'English non-proficient': '***', 'English proficient': '***'},
+            'occupation_type': {'blue collar': '***', 'white collar': '***'},
+            'race_ethnicity': {'Asian': '***', 'Black': '***', 'Hispanic or Latino': '***', 'White': '***'},
+            'sexual_orientation': {'heterosexual': '***', 'homosexual': '***'},
+            'socioeconomic_status': {'lower class': '***', 'middle class': '***', 'upper class': '***'}
+        }
+    }
+    
+    # Create triangle arrangement: 2 plots on top, 1 centered below (same size)
+    fig = plt.figure(figsize=(20, 12))
+    gs = fig.add_gridspec(2, 4, hspace=0.3, wspace=0.3)
+    
+    # Create axes in triangle arrangement
+    axes = []
+    if len(models) >= 1:
+        axes.append(fig.add_subplot(gs[0, 0:2]))  # Top left (spans 2 columns)
+    if len(models) >= 2:
+        axes.append(fig.add_subplot(gs[0, 2:4]))  # Top right (spans 2 columns)
+    if len(models) >= 3:
+        axes.append(fig.add_subplot(gs[1, 1:3]))  # Bottom center (spans 2 columns, centered)
     
     model_colors = {
+        'gpt-4o': '#1f77b4',
+        'llama-3.3-70b': '#ff7f0e',
         'qwen3-next-80b': '#d62728'
     }
     
-    # Get baseline data
-    baseline_model = baseline[baseline['base_model'] == model]
-    if len(baseline_model) == 0:
-        print(f"⚠️  No baseline data for qwen, skipping TTD duration plot")
-        return
-    
-    baseline_values = pd.to_numeric(baseline_model[outcome_col], errors='coerce')
-    baseline_avg = baseline_values.mean()
-    
-    # Collect data for all demographics with grouping
-    x_labels = ['Baseline']
-    averages = [baseline_avg]
-    colors_list = ['#555555']  # Dark gray for baseline
-    
-    full_model = full[full['model'] == model]
-    
-    # Build x_positions with gaps between demographic groups (more pronounced spacing)
-    x_positions = [0]  # Baseline at position 0
-    current_pos = 2.0  # Start first demographic group with gap after baseline
-    
-    for demo in demographics:
-        demo_values = sorted(full_model[demo].dropna().unique())
-        for demo_value in demo_values:
-            demo_data = full_model[full_model[demo] == demo_value]
-            demo_numeric = pd.to_numeric(demo_data[outcome_col], errors='coerce')
-            demo_avg = demo_numeric.mean()
-            
-            x_labels.append(f"{demo_value}")
-            averages.append(demo_avg)
-            colors_list.append(model_colors.get(model, '#888888'))
-            x_positions.append(current_pos)
-            current_pos += 1  # Space within group
+    for model_idx, model in enumerate(models):
+        ax = axes[model_idx]
         
-        # Add extra gap between demographic groups (increased for more pronounced grouping)
-        current_pos += 1.0
+        # Get baseline data
+        baseline_model = baseline[baseline['base_model'] == model]
+        if len(baseline_model) == 0:
+            continue
+        
+        baseline_values = pd.to_numeric(baseline_model[outcome_col], errors='coerce')
+        baseline_avg = baseline_values.mean()
+        
+        # Collect data for all demographics with grouping
+        x_labels = ['Baseline']
+        averages = [baseline_avg]
+        colors_list = ['#555555']  # Dark gray for baseline
+        
+        full_model = full[full['model'] == model]
+        
+        # Calculate ANOVA for each demographic category (for numeric TTD, we use the actual values not binary)
+        anova_results = {}
+        for demo in demographics:
+            # For TTD, test if average duration differs across demographic groups
+            groups = []
+            demo_values = sorted(full_model[demo].dropna().unique())
+            for demo_value in demo_values:
+                demo_data = full_model[full_model[demo] == demo_value]
+                demo_numeric = pd.to_numeric(demo_data[outcome_col], errors='coerce').dropna().values
+                if len(demo_numeric) > 0:
+                    groups.append(demo_numeric)
+            
+            if len(groups) >= 2:
+                try:
+                    f_stat, p_value = stats.f_oneway(*groups)
+                    if p_value < 0.05:
+                        anova_results[demo] = p_value
+                except:
+                    pass
+        
+        # Build x_positions with gaps between demographic groups (more pronounced spacing)
+        x_positions = [0]  # Baseline at position 0
+        current_pos = 2.0  # Start first demographic group with gap after baseline
+        significance_markers = [(0, None)]  # Store (position, stars) for plotting above bars - baseline has no stars
+        demographic_ranges = {}  # Store start and end positions for each demographic
+        
+        for demo in demographics:
+            demo_values = sorted(full_model[demo].dropna().unique())
+            demo_start = current_pos
+            for demo_value in demo_values:
+                demo_data = full_model[full_model[demo] == demo_value]
+                demo_numeric = pd.to_numeric(demo_data[outcome_col], errors='coerce')
+                demo_avg = demo_numeric.mean()
+                
+                # Check for significance markers (case-insensitive)
+                stars = None
+                if model in significant_ttd and demo in significant_ttd[model]:
+                    for sig_value, star_text in significant_ttd[model][demo].items():
+                        if demo_value.lower() == sig_value.lower():
+                            stars = star_text
+                            break
+                
+                x_labels.append(demo_value.title())  # Capitalize for consistency
+                averages.append(demo_avg)
+                colors_list.append(model_colors.get(model, '#888888'))
+                x_positions.append(current_pos)
+                significance_markers.append((current_pos, stars))  # Store for later
+                current_pos += 1  # Space within group
+            
+            demo_end = current_pos - 1
+            demographic_ranges[demo] = (demo_start, demo_end)
+            
+            # Add extra gap between demographic groups (increased for more pronounced grouping)
+            current_pos += 1.0
+        
+        # Handle llama's large baseline issue - set scale based on non-baseline values with axis break
+        if model == 'llama-3.3-70b' and baseline_avg > 1:  # Large baseline detected
+            # Fixed scale from 0 to 0.025 for demographic bars (most of the plot height)
+            lower_range_max = 0.025
+            
+            # Define break region
+            break_start = 0.027  # Just above 0.025
+            break_height = 0.003  # Small visual height for break region
+            upper_range_start = break_start + break_height
+            
+            # Upper region for baseline (compressed)
+            baseline_display_height = 0.008  # Visual height for baseline bar in upper region
+            baseline_top = upper_range_start + baseline_display_height
+            
+            # Plot all bars
+            x_positions = np.array(x_positions)
+            
+            # Plot non-baseline bars normally (in lower range)
+            for i in range(1, len(averages)):
+                ax.bar(x_positions[i], averages[i], width=0.8, 
+                      color=colors_list[i], alpha=0.8, edgecolor='black', linewidth=1)
+            
+            # Plot baseline bar in two pieces to traverse through the break
+            # Lower piece: from 0 to break_start
+            ax.bar(x_positions[0], break_start, width=0.8, bottom=0, 
+                  color=colors_list[0], alpha=0.8, edgecolor='black', linewidth=1)
+            
+            # Upper piece: in the upper region (represents the rest going to 2.28)
+            ax.bar(x_positions[0], baseline_display_height, width=0.8,
+                  bottom=upper_range_start, color=colors_list[0], 
+                  alpha=0.8, edgecolor='black', linewidth=1)
+            
+            # Draw white rectangle to cover the break region
+            ax.axhspan(break_start, upper_range_start, color='white', zorder=5, edgecolor='none')
+            
+            # Add zigzag break lines ONLY on the y-axis (left side)
+            n_zigzags = 8
+            zigzag_x_left = np.linspace(-1.5, 0, n_zigzags)  # Only on left y-axis area
+            
+            # Create zigzag pattern in the break region
+            zigzag_y = []
+            for i in range(n_zigzags):
+                if i % 2 == 0:
+                    zigzag_y.append(break_start + break_height * 0.25)
+                else:
+                    zigzag_y.append(upper_range_start - break_height * 0.25)
+            
+            ax.plot(zigzag_x_left, zigzag_y, 'k-', linewidth=2.5, zorder=7, clip_on=False, solid_capstyle='round')
+            
+            # Add value labels
+            # Baseline label - above the upper bar piece
+            ax.text(x_positions[0], baseline_top + 0.001, f'{baseline_avg:.2f}',
+                   ha='center', va='bottom', fontsize=4.5)
+            
+            # Non-baseline labels
+            for i in range(1, len(averages)):
+                ax.text(x_positions[i], averages[i] + 0.0005,  # Small fixed offset for 0-0.025 scale
+                       f'{averages[i]:.2f}', ha='center', va='bottom', fontsize=4.5)
+            
+            # Add significance markers
+            for i, (pos, stars) in enumerate(significance_markers):
+                if stars and i > 0:  # Skip baseline, only non-baseline bars
+                    ax.text(pos, averages[i] + 0.001,  # Reduced to 0.001 for closer positioning
+                           stars, ha='center', va='bottom', fontsize=8, fontweight='bold', color='black')
+            
+            # Add ANOVA horizontal bars for significant demographic categories
+            for demo, (start_pos, end_pos) in demographic_ranges.items():
+                if demo in anova_results:
+                    # Get the max height in this demographic group (excluding baseline)
+                    demo_indices = [i for i, pos in enumerate(x_positions) if start_pos <= pos <= end_pos and i > 0]
+                    if demo_indices:
+                        max_height = max([averages[i] for i in demo_indices])
+                        
+                        # Draw horizontal bar higher above the tallest bar to avoid asterisk overlap
+                        bar_y = max_height + 0.0035  # Positioned above asterisks
+                        line_y = max_height + 0.0028  # Positioned above asterisks
+                        ax.plot([start_pos - 0.4, end_pos + 0.4], [line_y, line_y], 
+                               color='black', linewidth=1.5, linestyle='-')
+                        
+                        # Add vertical ticks at ends
+                        ax.plot([start_pos - 0.4, start_pos - 0.4], [line_y - 0.0005, line_y + 0.0005], 
+                               color='black', linewidth=1.5)
+                        ax.plot([end_pos + 0.4, end_pos + 0.4], [line_y - 0.0005, line_y + 0.0005], 
+                               color='black', linewidth=1.5)
+                        
+                        # Add dagger symbol for ANOVA significance
+                        p_val = anova_results[demo]
+                        if p_val < 0.001:
+                            symbol = '†††'
+                        elif p_val < 0.01:
+                            symbol = '††'
+                        else:
+                            symbol = '†'
+                        
+                        ax.text((start_pos + end_pos) / 2, bar_y, symbol, 
+                               ha='center', va='bottom', fontsize=10, fontweight='bold', color='black')
+            
+            # Calculate adjusted top limit to accommodate ANOVA bars
+            max_anova_height = 0
+            for demo, (start_pos_temp, end_pos_temp) in demographic_ranges.items():
+                if demo in anova_results:
+                    demo_indices = [i for i, pos in enumerate(x_positions) if start_pos_temp <= pos <= end_pos_temp and i > 0]
+                    if demo_indices:
+                        max_height = max([averages[i] for i in demo_indices])
+                        # Calculate max position including symbol
+                        max_anova_height = max(max_anova_height, max_height + 0.0035 + 0.001)
+            
+            # Adjust baseline_top to accommodate ANOVA bars if needed
+            adjusted_baseline_top = max(baseline_top * 1.08, max_anova_height * 1.1) if max_anova_height > 0 else baseline_top * 1.08
+            
+            # Set y-ticks to show both ranges
+            # Lower range: 0 to 0.025 with appropriate intervals (most of the visible plot)
+            lower_ticks = [0, 0.005, 0.010, 0.015, 0.020, 0.025]
+            baseline_tick_pos = upper_range_start + (baseline_display_height / 2)
+            
+            ax.set_yticks(lower_ticks + [baseline_tick_pos])
+            tick_labels = ['0.000', '0.005', '0.010', '0.015', '0.020', '0.025', f'{baseline_avg:.2f}']
+            ax.set_yticklabels(tick_labels)
+            
+            ax.set_ylim(0, adjusted_baseline_top)
+        else:
+            # Normal plotting for gpt-4o and qwen
+            x_positions = np.array(x_positions)
+            bars = ax.bar(x_positions, averages, width=0.8, color=colors_list, alpha=0.8, edgecolor='black', linewidth=1)
+            
+            # Calculate dynamic offset based on y-axis range
+            y_max = max(averages) * 1.15
+            label_offset = y_max * 0.015  # 1.5% of y-axis range
+            
+            # Add value labels on bars with better positioning
+            for i, (bar, avg) in enumerate(zip(bars, averages)):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height + label_offset,
+                       f'{avg:.2f}', ha='center', va='bottom', fontsize=4.5)
+            
+            # Add significance markers above bars
+            for i, (pos, stars) in enumerate(significance_markers):
+                if stars:
+                    height = averages[i]
+                    ax.text(pos, height + (y_max * 0.03), stars,  # Reduced to 0.03 for closer positioning
+                           ha='center', va='bottom', fontsize=8, fontweight='bold', color='black')
+            
+            # Add ANOVA horizontal bars for significant demographic categories
+            for demo, (start_pos, end_pos) in demographic_ranges.items():
+                if demo in anova_results:
+                    # Get the max height in this demographic group
+                    demo_indices = [i for i, pos in enumerate(x_positions) if start_pos <= pos <= end_pos]
+                    max_height = max([averages[i] for i in demo_indices])
+                    
+                    # Draw horizontal bar above the tallest bar, positioned to avoid overlap but stay in bounds
+                    bar_y = max_height + (y_max * 0.07)  # Positioned above asterisks
+                    line_y = max_height + (y_max * 0.055)  # Positioned above asterisks
+                    ax.plot([start_pos - 0.4, end_pos + 0.4], [line_y, line_y], 
+                           color='black', linewidth=1.5, linestyle='-')
+                    
+                    # Add vertical ticks at ends
+                    ax.plot([start_pos - 0.4, start_pos - 0.4], [line_y - (y_max * 0.01), line_y + (y_max * 0.01)], 
+                           color='black', linewidth=1.5)
+                    ax.plot([end_pos + 0.4, end_pos + 0.4], [line_y - (y_max * 0.01), line_y + (y_max * 0.01)], 
+                           color='black', linewidth=1.5)
+                    
+                    # Add dagger symbol for ANOVA significance
+                    p_val = anova_results[demo]
+                    if p_val < 0.001:
+                        symbol = '†††'
+                    elif p_val < 0.01:
+                        symbol = '††'
+                    else:
+                        symbol = '†'
+                    
+                    ax.text((start_pos + end_pos) / 2, bar_y, symbol, 
+                           ha='center', va='bottom', fontsize=10, fontweight='bold', color='black')
+            
+            # Calculate adjusted y-max to accommodate ANOVA bars
+            max_anova_height = 0
+            for demo, (start_pos, end_pos) in demographic_ranges.items():
+                if demo in anova_results:
+                    demo_indices = [i for i, pos in enumerate(x_positions) if start_pos <= pos <= end_pos]
+                    if demo_indices:
+                        max_height = max([averages[i] for i in demo_indices])
+                        # Include the symbol height in calculation
+                        max_anova_height = max(max_anova_height, max_height + (y_max * 0.07) + (y_max * 0.02))
+            
+            # Use the larger of y_max or max_anova_height
+            adjusted_y_max = max(y_max, max_anova_height) if max_anova_height > 0 else y_max
+            
+            ax.set_ylim(0, adjusted_y_max)
+        
+        # Formatting
+        ax.set_title(f'{model}', fontsize=13, fontweight='bold')
+        # Show ylabel on left plots (idx 0 and 2)
+        if model_idx in [0, 2]:
+            ax.set_ylabel('Average TTD Duration (weeks)', fontsize=11)
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(x_labels, rotation=90, ha='right', fontsize=7)
+        ax.grid(axis='y', alpha=0.3, linestyle='--')  # Only horizontal grid lines
+        ax.grid(axis='x', visible=False)  # Remove vertical grid lines
+        ax.set_xlim(-0.5, max(x_positions) + 0.5)  # Adjust x-axis limits
     
-    # Plot bars
-    x_positions = np.array(x_positions)
-    bars = ax.bar(x_positions, averages, width=0.8, color=colors_list, alpha=0.8, edgecolor='black', linewidth=1)
-    
-    # Add value labels on bars (very small font size)
-    for i, (bar, avg) in enumerate(zip(bars, averages)):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height + 0.05,
-               f'{avg:.1f}', ha='center', va='bottom', fontsize=4.5)
-    
-    # Formatting
-    ax.set_title(f'{model}', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Average TTD Duration (weeks)', fontsize=10)
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(x_labels, rotation=90, ha='right', fontsize=7)
-    ax.grid(axis='y', alpha=0.3, linestyle='--')  # Only horizontal grid lines
-    ax.grid(axis='x', visible=False)  # Remove vertical grid lines
-    ax.set_xlim(-0.5, max(x_positions) + 0.5)  # Adjust x-axis limits
-    ax.set_ylim(0, max(averages) * 1.15)
+    # Add significance notes
+    fig.text(0.02, 0.02, '*** p < 0.001 (compared to baseline)', 
+            fontsize=9, style='italic', ha='left', va='bottom')
+    fig.text(0.02, 0.005, '† p < 0.05, †† p < 0.01, ††† p < 0.001 (ANOVA across demographic group)', 
+            fontsize=9, style='italic', ha='left', va='bottom')
     
     plt.tight_layout()
     
@@ -800,8 +1195,8 @@ def plot_medication_distribution_by_model(baseline, full, output_dir):
         'Opioid': '#DC143C'              # Crimson
     }
     
-    # Create single plot for gpt-4o only
-    fig, ax = plt.subplots(1, 1, figsize=(14, 12))
+    # Create single plot for gpt-4o only (increased height for labels with asterisks)
+    fig, ax = plt.subplots(1, 1, figsize=(15, 14))
     
     model = 'gpt-4o'
     
@@ -813,9 +1208,66 @@ def plot_medication_distribution_by_model(baseline, full, output_dir):
         print(f"⚠️  No baseline data for gpt-4o, skipping medication plot")
         return
     
-    # Collect all bars data
+    # Define which demographics are significant (all for gpt-4o based on the table)
+    # All demographic categories show *** (p<0.001) compared to baseline
+    significant_demographics = {
+        'age_band': ['old', 'young'],
+        'gender_identity': ['cisgender man', 'cisgender woman', 'transgender man', 'transgender woman'],
+        'geography': ['rural', 'suburban', 'urban'],
+        'language_proficiency': ['English non-proficient', 'English proficient'],
+        'occupation_type': ['blue collar', 'white collar'],
+        'race_ethnicity': ['Asian', 'Black', 'Hispanic or Latino', 'White'],
+        'sexual_orientation': ['heterosexual', 'homosexual'],
+        'socioeconomic_status': ['lower class', 'middle class', 'upper class']
+    }
+    
+    # Calculate chi-squared test for each demographic category
+    # Tests if medication distribution differs across demographic groups
+    # Only include medication types with non-zero counts to avoid sparse data issues
+    anova_results = {}  # Actually chi-squared for categorical medication outcome
+    for demo in demographics:
+        demo_values = sorted(full_model[demo].dropna().unique())
+        if len(demo_values) >= 2:
+            # First, identify which medication types have non-zero counts across all groups
+            med_with_data = []
+            for med in med_types:
+                has_data = False
+                for demo_value in demo_values:
+                    demo_data = full_model[full_model[demo] == demo_value]
+                    if (demo_data[outcome_col] == med).sum() > 0:
+                        has_data = True
+                        break
+                if has_data:
+                    med_with_data.append(med)
+            
+            # Only proceed if we have at least 2 medication types with data
+            if len(med_with_data) >= 2:
+                # Create contingency table: rows = demographic values, columns = non-zero medication types
+                contingency_rows = []
+                for demo_value in demo_values:
+                    demo_data = full_model[full_model[demo] == demo_value]
+                    counts = demo_data[outcome_col].value_counts()
+                    row = [counts.get(med, 0) for med in med_with_data]
+                    contingency_rows.append(row)
+                
+                contingency = np.array(contingency_rows)
+                
+                # Check that all rows have at least some data
+                if contingency.sum(axis=1).min() > 0:
+                    try:
+                        chi2, p_value, dof, _ = stats.chi2_contingency(contingency)
+                        if p_value < 0.05:
+                            anova_results[demo] = p_value
+                            print(f"  {demo}: χ²={chi2:.2f}, p={p_value:.4f} (using {len(med_with_data)} medication types)")
+                    except Exception as e:
+                        # Chi-squared test still fails
+                        pass
+    
+    # Collect all bars data with grouping
     y_labels = ['Baseline']
     bar_data = []  # List of dicts with medication percentages
+    y_positions_list = [0]  # Track positions with gaps
+    demographic_ranges = {}  # Store start and end positions for each demographic
     
     # Baseline percentages
     baseline_counts = baseline_model[outcome_col].value_counts()
@@ -824,8 +1276,12 @@ def plot_medication_distribution_by_model(baseline, full, output_dir):
                     for med in med_types}
     bar_data.append(baseline_pcts)
     
-    # Add each demographic category
+    # Start demographic groups with gap after baseline
+    current_pos = 1.5
+    
+    # Add each demographic category with spacing between groups
     for demo in demographics:
+        demo_start = current_pos
         demo_values = sorted(full_model[demo].dropna().unique())
         for demo_value in demo_values:
             demo_data = full_model[full_model[demo] == demo_value]
@@ -834,56 +1290,166 @@ def plot_medication_distribution_by_model(baseline, full, output_dir):
             demo_pcts = {med: (demo_counts.get(med, 0) / demo_total * 100) 
                        for med in med_types}
             
-            y_labels.append(f"{demo_value}")
+            # Add asterisks if significant (case-insensitive comparison)
+            # Capitalize demographic value for consistent display
+            label = demo_value.title()
+            if demo in significant_demographics:
+                # Check if this demographic value is in the significant list (case-insensitive)
+                sig_values_lower = [v.lower() for v in significant_demographics[demo]]
+                if demo_value.lower() in sig_values_lower:
+                    label = f"{demo_value.title()} ***"
+            
+            y_labels.append(label)
             bar_data.append(demo_pcts)
+            y_positions_list.append(current_pos)
+            current_pos += 0.8  # Closer spacing within same demographic group
+        
+        demo_end = current_pos - 0.8  # End is at the last bar position
+        demographic_ranges[demo] = (demo_start, demo_end)
+        
+        # Add gap between demographic groups
+        current_pos += 0.6
     
-    # Create horizontal stacked bars
-    y_positions = np.arange(len(y_labels))
+    # Create horizontal stacked bars with custom positions
+    y_positions = np.array(y_positions_list)
     left_accumulator = np.zeros(len(y_labels))
     
     for med_type in med_types:
         widths = [data[med_type] for data in bar_data]
-        ax.barh(y_positions, widths, left=left_accumulator, 
+        
+        # Slightly enlarge very small sections for visibility (only for blue - Prescription non-opioid)
+        visual_widths = []
+        for width in widths:
+            if med_type == 'Prescription non-opioid':
+                # Blue bars - keep them smaller and more honest
+                if 0 < width <= 0.1:
+                    visual_widths.append(0.8)  # Small enlargement for visibility
+                elif 0 < width < 1.0:
+                    visual_widths.append(max(width, 1.2))  # Slight minimum
+                else:
+                    visual_widths.append(width)
+            else:
+                # All other colors - keep original behavior
+                if 0 < width <= 0.1:
+                    visual_widths.append(3.0)
+                elif 0 < width < 1.0:
+                    visual_widths.append(1.5)
+                else:
+                    visual_widths.append(width)
+        
+        ax.barh(y_positions, visual_widths, height=0.7, left=left_accumulator, 
                color=med_colors[med_type], label=med_type,
                edgecolor='white', linewidth=0.5)
         
-        # Add percentage labels (only if > 3% to avoid clutter)
-        for i, width in enumerate(widths):
-            if width > 3:
-                ax.text(left_accumulator[i] + width/2, y_positions[i], 
-                       f'{width:.0f}%', ha='center', va='center', 
-                       fontsize=7, fontweight='bold', color='black')
+        # Add percentage labels - special handling for blue (Prescription non-opioid)
+        for i, (width, visual_width) in enumerate(zip(widths, visual_widths)):
+            if width > 0:  # Show all non-zero percentages
+                # Format label: show "< 0.1" for values that round to 0.0%, otherwise show 1 decimal
+                if width < 0.05:  # This will round to 0.0 with 1 decimal place
+                    label = '< 0.1'
+                else:
+                    label = f'{width:.1f}'
+                
+                # Consistent font size for all labels
+                fontsize = 6
+                
+                # Special handling for blue bars (Prescription non-opioid)
+                if med_type == 'Prescription non-opioid' and visual_width < 3.0:
+                    # Place label in white space ABOVE the bar with elbow arrow pointing down
+                    x_bar_center = left_accumulator[i] + visual_width/2
+                    y_bar = y_positions[i]
+                    
+                    # Place label above the bar
+                    x_label = x_bar_center
+                    y_label = y_bar - 0.6  # Above the bar (negative y is up since axis is inverted)
+                    
+                    # Draw elbow arrow: vertical from label down, then horizontal to bar center
+                    # Start from label, go down, then to bar
+                    ax.annotate('', 
+                               xy=(x_bar_center, y_bar - 0.35),  # End at top of bar
+                               xytext=(x_label, y_label + 0.15),  # Start from bottom of label
+                               arrowprops=dict(arrowstyle='-', color='black', lw=0.5,
+                                             connectionstyle="arc,angleA=-90,angleB=90,armA=5,armB=0"))
+                    
+                    ax.text(x_label, y_label, label, ha='center', va='center',
+                           fontsize=fontsize, fontweight='bold', color='black',
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                                   edgecolor='black', linewidth=0.5))
+                else:
+                    # All other colors or large blue bars - keep inside the bar
+                    ax.text(left_accumulator[i] + visual_width/2, y_positions[i], 
+                           label, ha='center', va='center', 
+                           fontsize=fontsize, fontweight='bold', color='black')
         
-        left_accumulator += widths
+        left_accumulator += visual_widths
+    
+    # Add ANOVA vertical bars for significant demographic categories (between demographic labels and legend)
+    for demo, (start_pos, end_pos) in demographic_ranges.items():
+        if demo in anova_results:
+            # Draw vertical line close to demographic labels (at x=102), before legend (at ~x=105)
+            # Positioned at x=103-104 to be between demographic labels and legend
+            bar_x = 104.5  # Position between demographic labels and legend
+            line_x = 104
+            ax.plot([line_x, line_x], [start_pos, end_pos], 
+                   color='black', linewidth=1.5, linestyle='-', clip_on=False)
+            
+            # Add horizontal ticks at ends
+            ax.plot([line_x - 0.5, line_x + 0.5], [start_pos, start_pos], 
+                   color='black', linewidth=1.5, clip_on=False)
+            ax.plot([line_x - 0.5, line_x + 0.5], [end_pos, end_pos], 
+                   color='black', linewidth=1.5, clip_on=False)
+            
+            # Add dagger symbol for significance
+            p_val = anova_results[demo]
+            if p_val < 0.001:
+                symbol = '†††'
+            elif p_val < 0.01:
+                symbol = '††'
+            else:
+                symbol = '†'
+            
+            ax.text(bar_x, (start_pos + end_pos) / 2, symbol, 
+                   ha='center', va='center', fontsize=10, fontweight='bold', 
+                   color='black', clip_on=False, rotation=90)
     
     # Formatting
     ax.set_title(f'{model}', fontsize=12, fontweight='bold', pad=10)
     ax.set_xlabel('Medication Distribution (%)', fontsize=10)
     ax.set_yticks(y_positions)
-    ax.set_yticklabels(y_labels, fontsize=8)
+    ax.set_yticklabels(y_labels, fontsize=7)  # Slightly smaller to accommodate asterisks
     ax.set_xlim(0, 100)
+    ax.set_ylim(-0.5, max(y_positions) + 1)  # Adjust y-axis to fit new spacing
     ax.grid(axis='x', alpha=0.3, linestyle='--')
     ax.invert_yaxis()  # Baseline at top
     
-    # Add demographic group separators
-    current_pos = 1  # After baseline
+    # Add demographic group separators and labels
+    separator_pos = 1.5  # Start after baseline (matching the initial current_pos)
     for demo in demographics:
         demo_values = sorted(full_model[demo].dropna().unique())
         n_values = len(demo_values)
         if n_values > 0:
             # Add horizontal line before this demographic group
-            ax.axhline(y=current_pos - 0.5, color='red', linestyle='--', 
-                      alpha=0.5, linewidth=1.5)
+            ax.axhline(y=separator_pos - 0.4, color='gray', linestyle='-', 
+                      alpha=0.3, linewidth=1.0)
             # Add demographic label on the right
-            mid_pos = current_pos + (n_values - 1) / 2
-            ax.text(102, mid_pos, demo.replace('_', ' ').title(),
+            # Calculate middle position: start + (n_values * 0.8 spacing - 0.8) / 2
+            mid_pos = separator_pos + ((n_values - 1) * 0.8) / 2
+            # Capitalize demographic name consistently
+            demo_label = demo.replace('_', ' ').title()
+            ax.text(102, mid_pos, demo_label,
                    ha='left', va='center', fontsize=7, style='italic', rotation=-90,
                    bbox=dict(boxstyle='round,pad=0.3', facecolor='wheat', alpha=0.5))
-            current_pos += n_values
+            separator_pos += n_values * 0.8 + 0.6  # Match the spacing logic
     
     # Legend
     ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=9, 
              title='Medication Type', framealpha=0.9)
+    
+    # Add significance notes (positioned lower to avoid overlap)
+    fig.text(0.02, 0.015, '*** p < 0.001 (significant difference from baseline)', 
+            fontsize=8, style='italic', ha='left', va='bottom')
+    fig.text(0.02, -0.005, '† p < 0.05, †† p < 0.01, ††† p < 0.001 (Chi-squared across demographic group)', 
+            fontsize=8, style='italic', ha='left', va='bottom')
     
     plt.tight_layout()
     

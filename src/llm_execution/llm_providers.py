@@ -8,7 +8,7 @@ import requests
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-import config
+from src import config
 
 logger = logging.getLogger(__name__)
 
